@@ -48,31 +48,34 @@ from ..core.constants import (
 def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="🆕 Создать встречу", callback_data=CB_CREATE)],
-        [
-            InlineKeyboardButton(text="📂 Мои встречи", callback_data=CB_MY),
-            InlineKeyboardButton(text="📝 Активные", callback_data=CB_ACTIVE),
-        ],
-        [InlineKeyboardButton(text="⚙️ Настройки", callback_data=CB_SETTINGS)],
-        [InlineKeyboardButton(text="❓ Справка", callback_data=CB_HELP)],
+        [InlineKeyboardButton(text="📂 Мои встречи", callback_data=CB_MY)],
     ]
+    if is_admin:
+        rows[-1].append(InlineKeyboardButton(text="📝 Активные", callback_data=CB_ACTIVE))
+        rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data=CB_SETTINGS)])
+    rows.append([InlineKeyboardButton(text="❓ Справка", callback_data=CB_HELP)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def reply_menu_kb() -> ReplyKeyboardMarkup:
+def reply_menu_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
     """Отдельная клавиатура под строкой ввода с ключевыми действиями."""
 
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="➕ Создать встречу"),
-                KeyboardButton(text="📂 Мои встречи"),
-            ],
+    rows: list[list[KeyboardButton]] = [
+        [
+            KeyboardButton(text="➕ Создать встречу"),
+            KeyboardButton(text="📂 Мои встречи"),
+        ]
+    ]
+    if is_admin:
+        rows.append(
             [
                 KeyboardButton(text="📝 Активные"),
                 KeyboardButton(text="⚙️ Настройки"),
-            ],
-            [KeyboardButton(text="❓ Справка")],
-        ],
+            ]
+        )
+    rows.append([KeyboardButton(text="❓ Справка")])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
         resize_keyboard=True,
         one_time_keyboard=False,
         input_field_placeholder="Выберите действие…",
@@ -161,7 +164,7 @@ def job_kb(job_id: str, rrule: str = RR_ONCE) -> InlineKeyboardMarkup:
     )
 
 
-def choose_chat_kb(chats: list, token: str) -> InlineKeyboardMarkup:
+def choose_chat_kb(chats: list, token: str, *, is_admin: bool = False) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for chat in chats:
         chat_id = chat.get("chat_id")
@@ -175,7 +178,8 @@ def choose_chat_kb(chats: list, token: str) -> InlineKeyboardMarkup:
                 )
             ]
         )
-    rows.append([InlineKeyboardButton(text="📝 Активные", callback_data=CB_ACTIVE)])
+    if is_admin:
+        rows.append([InlineKeyboardButton(text="📝 Активные", callback_data=CB_ACTIVE)])
     rows.append([InlineKeyboardButton(text="❓ Справка", callback_data=CB_HELP)])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_MENU)])
     return InlineKeyboardMarkup(inline_keyboard=rows)

@@ -279,7 +279,11 @@ async def _ensure_reply_menu(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     if data.get(STATE_REPLY_MENU_SHOWN):
         return
-    await _answer_safe(message, "👇 Быстрые действия", reply_markup=ui_kb.reply_menu_kb())
+    await _answer_safe(
+        message,
+        "👇 Быстрые действия",
+        reply_markup=ui_kb.reply_menu_kb(_is_admin(message.from_user)),
+    )
     await state.update_data({STATE_REPLY_MENU_SHOWN: True})
 
 
@@ -328,7 +332,11 @@ async def _pick_target_for_private(message: Message, state: FSMContext, text: st
     pending[token] = {"text": text}
     await state.update_data({STATE_PENDING: pending})
     candidates.append({"chat_id": message.chat.id, "title": "Личный чат"})
-    await _answer_safe(message, "📨 Куда отправить напоминание?", reply_markup=ui_kb.choose_chat_kb(candidates, token))
+    await _answer_safe(
+        message,
+        "📨 Куда отправить напоминание?",
+        reply_markup=ui_kb.choose_chat_kb(candidates, token, is_admin=_is_admin(message.from_user)),
+    )
     return True
 
 
@@ -431,6 +439,9 @@ async def _show_active(
     page: int = 1,
     mine: bool = False,
 ) -> None:
+    if not mine and not _is_admin(user):
+        await _answer_safe(message, "⛔ Только администратор может просматривать активные напоминания.")
+        return
     predicate: Optional[Callable[[Dict[str, Any]], bool]] = None
     title = "📝 Активные"
     page_prefix = constants.CB_ACTIVE_PAGE
@@ -487,6 +498,9 @@ async def _show_create_hint(message: Message, user: Optional[User]) -> None:
 
 
 async def _show_settings(message: Message, user: Optional[User], state: FSMContext) -> None:
+    if not _is_admin(user):
+        await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+        return
     await state.update_data({STATE_AWAIT_TZ: False, STATE_AWAIT_ADMIN_ADD: False, STATE_AWAIT_ADMIN_DEL: False})
     kb = ui_kb.settings_menu_kb(_is_owner(user))
     text = "⚙️ Настройки"
@@ -824,6 +838,10 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         return
 
     if data == constants.CB_SET_TZ:
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
         kb = ui_kb.tz_menu_kb()
         try:
             await _edit_text_safe(message, "Выберите таймзону", reply_markup=kb)
@@ -833,6 +851,10 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         return
 
     if data == constants.CB_SET_TZ_LOCAL:
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
         tz_name = get_localzone_name()
         storage.update_chat_cfg(message.chat.id, tz=tz_name)
         await _answer_safe(message, f"TZ обновлена: {tz_name}")
@@ -840,24 +862,40 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         return
 
     if data == constants.CB_SET_TZ_MOSCOW:
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
         storage.update_chat_cfg(message.chat.id, tz="Europe/Moscow")
         await _answer_safe(message, "TZ обновлена: Europe/Moscow")
         await _callback_answer_safe(query)
         return
 
     if data == constants.CB_SET_TZ_CHICAGO:
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
         storage.update_chat_cfg(message.chat.id, tz="America/Chicago")
         await _answer_safe(message, "TZ обновлена: America/Chicago")
         await _callback_answer_safe(query)
         return
 
     if data == constants.CB_SET_TZ_ENTER:
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
         await state.update_data({STATE_AWAIT_TZ: True})
         await _answer_safe(message, "Введи название таймзоны, например `Europe/Moscow`", parse_mode=ParseMode.MARKDOWN)
         await _callback_answer_safe(query)
         return
 
     if data == constants.CB_SET_OFFSET:
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
         kb = ui_kb.offset_menu_kb()
         try:
             await _edit_text_safe(message, "⏳ Выберите оффсет", reply_markup=kb)
@@ -867,6 +905,10 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         return
 
     if data in {constants.CB_OFF_DEC, constants.CB_OFF_INC} or data.startswith("off_p"):
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
         entry = storage.get_chat_cfg_entry(message.chat.id)
         current = int(entry.get("offset", 30))
         if data == constants.CB_OFF_DEC:
@@ -884,11 +926,19 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         return
 
     if data == constants.CB_CHATS:
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
         await _show_chats(message)
         await _callback_answer_safe(query)
         return
 
     if data.startswith(f"{constants.CB_CHAT_DEL}:"):
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
         parts = data.split(":")
         chat_id = parts[1] if len(parts) > 1 else None
         topic_id = int(parts[2]) if len(parts) > 2 else 0
@@ -899,17 +949,29 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         return
 
     if data == constants.CB_ADMINS:
+        if not _is_owner(user):
+            await _answer_safe(message, "⛔ Только владелец может управлять администраторами.")
+            await _callback_answer_safe(query)
+            return
         await _show_admins(message)
         await _callback_answer_safe(query)
         return
 
     if data == constants.CB_ADMIN_ADD:
+        if not _is_owner(user):
+            await _answer_safe(message, "⛔ Только владелец может управлять администраторами.")
+            await _callback_answer_safe(query)
+            return
         await state.update_data({STATE_AWAIT_ADMIN_ADD: True})
         await _answer_safe(message, "Введи @username для добавления")
         await _callback_answer_safe(query)
         return
 
     if data.startswith(f"{constants.CB_ADMIN_DEL}:"):
+        if not _is_owner(user):
+            await _answer_safe(message, "⛔ Только владелец может управлять администраторами.")
+            await _callback_answer_safe(query)
+            return
         username = data.split(":", 1)[1]
         removed = storage.remove_admin_username(username)
         await _answer_safe(message, "✅ Удалён" if removed else "⚠️ Не найден")

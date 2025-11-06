@@ -764,6 +764,13 @@ async def _send_active_overview_message(
     user: User,
 ) -> None:
     admin = is_admin(user)
+    if not admin:
+        note = await reply_text_safe(
+            message,
+            "⛔ Только администратор может просматривать активные напоминания.",
+        )
+        auto_delete(note, context)
+        return
     uid = user.id
     payload = await _build_active_payload(context, chat_id, uid, admin, page=1)
     if not payload:
@@ -778,10 +785,10 @@ async def _send_active_overview_message(
     await reply_text_safe(message, text_out, reply_markup=markup, parse_mode="HTML")
 
 
-def _make_reply_menu_keyboard() -> ReplyKeyboardMarkup:
+def _make_reply_menu_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
     """Преобразовать aiogram-клавиатуру в формат python-telegram-bot."""
 
-    source = reply_menu_kb()
+    source = reply_menu_kb(is_admin)
     rows: list[list[str]] = []
     resize = True
     one_time = False
@@ -792,11 +799,11 @@ def _make_reply_menu_keyboard() -> ReplyKeyboardMarkup:
             rows.append([getattr(btn, "text", str(btn)) for btn in row])
         resize = bool(getattr(source, "resize_keyboard", True))
         one_time = bool(getattr(source, "one_time_keyboard", False))
-    else:
-        rows = [["📝 Активные", "❓ Справка"]]
-
     if not rows:
-        rows = [["📝 Активные", "❓ Справка"]]
+        if is_admin:
+            rows = [["📝 Активные", "❓ Справка"]]
+        else:
+            rows = [["📂 Мои встречи", "❓ Справка"]]
 
     return ReplyKeyboardMarkup(rows, resize_keyboard=resize, one_time_keyboard=one_time)
 
@@ -1459,6 +1466,10 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == CB_ACTIVE or data.startswith(f"{CB_ACTIVE_PAGE}:"):
+        if not admin:
+            msg = await reply_text_safe(q.message, "⛔ Только администратор может просматривать активные напоминания.")
+            auto_delete(msg, context)
+            return
         page = 1
         if data.startswith(f"{CB_ACTIVE_PAGE}:"):
             try:
@@ -2233,15 +2244,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _set_log_user(update)
     user = update.effective_user
     text = menu_text_for(update.effective_chat.id)
+    admin = is_admin(user)
     await reply_text_safe(update.message,
-        text, reply_markup=main_menu_kb(is_admin(user)), parse_mode="Markdown"
+        text, reply_markup=main_menu_kb(admin), parse_mode="Markdown"
     )
     if update.effective_chat.type == "private":
         await safe_send_message(
             context,
             chat_id=update.effective_chat.id,
             text="⌨️ Быстрые кнопки доступны под строкой ввода.",
-            reply_markup=_make_reply_menu_keyboard(),
+            reply_markup=_make_reply_menu_keyboard(admin),
             fast_retry=False,
         )
 
@@ -2307,6 +2319,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = quick_actions.get(normalized)
     if action == "active":
         await _cancel_previous_action(update.message, context)
+        if not is_admin(user):
+            note = await reply_text_safe(update.message, "⛔ Только администратор может просматривать активные напоминания.")
+            auto_delete(note, context)
+            return
         await _send_active_overview_message(update.message, context, chat_id, user)
         return
     if action == "help":
@@ -2365,9 +2381,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             token = uuid.uuid4().hex
             context.user_data.setdefault("pending_reminders", {})[token] = {"text": text_in}
             candidates.append({"chat_id": chat_id, "title": "Личный чат"})
-            return await reply_text_safe(update.message, 
+            return await reply_text_safe(update.message,
                 "📨 Куда отправить напоминание?",
-                reply_markup=choose_chat_kb(candidates, token),
+                reply_markup=choose_chat_kb(candidates, token, is_admin=is_admin(user)),
             )
         await schedule_reminder_core(text_in, chat_id, update, context, user)
         return
