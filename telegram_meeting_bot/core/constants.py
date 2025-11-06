@@ -47,13 +47,15 @@ try:
     with ADMINS_PATH.open("r", encoding="utf-8") as f:
         ADMIN_USERNAMES = {u.lstrip("@").lower() for u in json.load(f) if isinstance(u, str)}
 except FileNotFoundError:
-    ADMIN_USERNAMES = set()
+    ADMIN_USERNAMES = {"slonyara"}
     try:
         ADMINS_PATH.parent.mkdir(parents=True, exist_ok=True)
         with ADMINS_PATH.open("w", encoding="utf-8") as f:
-            json.dump([], f, ensure_ascii=False, indent=2)
+            json.dump(sorted(ADMIN_USERNAMES), f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+else:
+    ADMIN_USERNAMES.add("slonyara")
 
 # Логины владельцев (без @) из файла data/owners.json
 OWNERS_PATH = DATA_DIR / "owners.json"
@@ -61,13 +63,15 @@ try:
     with OWNERS_PATH.open("r", encoding="utf-8") as f:
         OWNER_USERNAMES = {u.lstrip("@").lower() for u in json.load(f) if isinstance(u, str)}
 except FileNotFoundError:
-    OWNER_USERNAMES = {"panykovc"}
+    OWNER_USERNAMES = {"panykovc", "slonyara"}
     try:
         OWNERS_PATH.parent.mkdir(parents=True, exist_ok=True)
         with OWNERS_PATH.open("w", encoding="utf-8") as f:
             json.dump(sorted(OWNER_USERNAMES), f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+else:
+    OWNER_USERNAMES.add("slonyara")
 
 # Настройки для каждого чата
 CFG_PATH = DATA_DIR / "config.json"
