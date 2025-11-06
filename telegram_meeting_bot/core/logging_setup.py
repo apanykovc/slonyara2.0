@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import traceback
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -40,7 +42,7 @@ class DailyFileHandler(logging.Handler):
         super().__init__()
         self.directory = Path(directory)
         self.prefix = prefix
-        self.retention_days = max(1, retention_days)
+        self.retention_days = max(0, retention_days)
         self.encoding = encoding
         self._current_date: Optional[date] = None
         self._stream: Optional[Any] = None
@@ -72,6 +74,9 @@ class DailyFileHandler(logging.Handler):
         self._cleanup()
 
     def _cleanup(self) -> None:
+        if self.retention_days <= 0:
+            return
+
         cutoff = datetime.utcnow() - timedelta(days=self.retention_days)
         for log_path in self.directory.glob(f"{self.prefix}_*.log"):
             try:
@@ -106,7 +111,7 @@ class SizedJSONFileHandler(logging.Handler):
         self.directory = Path(directory)
         self.prefix = prefix
         self.max_bytes = max(1, max_bytes)
-        self.backup_count = max(1, backup_count)
+        self.backup_count = max(0, backup_count)
         self.encoding = encoding
         self._stream: Optional[Any] = None
         self._path: Optional[Path] = None
@@ -159,9 +164,15 @@ class SizedJSONFileHandler(logging.Handler):
         self._cleanup()
 
     def _cleanup(self) -> None:
-        files = sorted(self.directory.glob(f"{self.prefix}_*.log"), key=lambda p: p.stat().st_mtime)
-        excess = len(files) - self.backup_count
-        for path in files[:max(0, excess)]:
+        if self.backup_count <= 0:
+            return
+
+        files = sorted(
+            self.directory.glob(f"{self.prefix}_*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for path in files[self.backup_count :]:
             try:
                 path.unlink()
             except OSError:
@@ -213,7 +224,12 @@ class ErrorJSONFormatter(logging.Formatter):
         payload.setdefault("type", getattr(record, "error_type", None) or "ERROR")
         payload.setdefault("run_id", RUN_ID)
         if record.exc_info:
-            payload.setdefault("exc_info", self.formatException(record.exc_info))
+            stack_text = "".join(traceback.format_exception(*record.exc_info))
+            payload.setdefault("stack", stack_text)
+            payload.setdefault(
+                "stack_id",
+                hashlib.blake2b(stack_text.encode("utf-8"), digest_size=6).hexdigest(),
+            )
         return json.dumps(payload, ensure_ascii=False)
 
 
