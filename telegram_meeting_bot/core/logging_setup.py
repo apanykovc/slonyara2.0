@@ -233,6 +233,7 @@ def setup_logging(level: str | int | None = None) -> logging.Logger:
     root_logger = logging.getLogger()
     root_logger.setLevel(resolved_level)
     root_logger.handlers.clear()
+    logging.captureWarnings(True)
 
     error_handler = SizedJSONFileHandler(
         LOGS_ERROR_DIR,
