@@ -1,21 +1,21 @@
 import json
-import os
 import logging
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Union
 
 import pytz
 from tzlocal import get_localzone_name
 
 from .constants import (
+    ADMINS_PATH,
+    ADMIN_USERNAMES,
     CFG_PATH,
     JOBS_DB_PATH,
     LEGACY_JOBS_PATH,
     TARGETS_PATH,
-    ADMINS_PATH,
-    ADMIN_USERNAMES,
 )
 
 logger = logging.getLogger("reminder-bot")
