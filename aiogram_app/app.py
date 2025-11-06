@@ -1,680 +1,730 @@
-
-"""
-Aiogram v3 entrypoint for the meeting reminder bot.
-Keeps the original logic (parsing, DB, keyboards, texts) and replaces PTB with aiogram+APScheduler.
-Run with: python -m telegram_meeting_bot.aiogram_app
-"""
-
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
-from typing import Optional
+import time
+import uuid
+from contextlib import suppress
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, Optional
 
+import pytz
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardMarkup, Message, User
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
+from tzlocal import get_localzone_name
 
-# Import project modules (do not import anything heavy at top-level in case deps missing during tools runtime)
-from telegram_meeting_bot.core import storage, constants
-from telegram_meeting_bot.ui.keyboards import (
-    main_menu_kb, settings_menu_kb, tz_menu_kb, offset_menu_kb,
-    admins_menu_kb, chats_menu_kb, active_kb,
-)
-from telegram_meeting_bot.ui.texts import (
-    menu_text_for, show_help_text, render_active_text,
-)
-
-from aiogram.types import InlineKeyboardMarkup as AInlineKeyboardMarkup, InlineKeyboardButton as AInlineKeyboardButton
-
-def mk_markup(kb):
-    """
-    Convert legacy PTB InlineKeyboardMarkup to aiogram InlineKeyboardMarkup if needed.
-    Accepts aiogram markup, PTB-like objects with .inline_keyboard, or dicts.
-    """
-    if kb is None:
-        return None
-    if isinstance(kb, AInlineKeyboardMarkup):
-        return kb
-    # PTB-like
-    try:
-        rows = []
-        inline = getattr(kb, "inline_keyboard", None)
-        if inline:
-            for row in inline:
-                new_row = []
-                for btn in row:
-                    text = getattr(btn, "text", "")
-                    cd = getattr(btn, "callback_data", None)
-                    url = getattr(btn, "url", None)
-                    if cd is not None:
-                        new_row.append(AInlineKeyboardButton(text=text, callback_data=cd))
-                    elif url:
-                        new_row.append(AInlineKeyboardButton(text=text, url=url))
-                if new_row:
-                    rows.append(new_row)
-            if rows:
-                return AInlineKeyboardMarkup(inline_keyboard=rows)
-    except Exception:
-        pass
-    # Dict-like
-    try:
-        if isinstance(kb, dict) and "inline_keyboard" in kb:
-            # assume aiogram-compatible structure
-            return AInlineKeyboardMarkup(inline_keyboard=[
-                [
-                    (AInlineKeyboardButton(text=b.get("text",""), callback_data=b.get("callback_data"))
-                     if "callback_data" in b else
-                     AInlineKeyboardButton(text=b.get("text",""), url=b.get("url"))
-                    )
-                    for b in row
-                ] for row in kb["inline_keyboard"]
-            ])
-    except Exception:
-        pass
-    # Fallback: nothing
-    return None
-
-async def answer_with_kb(message, text, kb=None, **kwargs):
-    kwargs.pop("reply_markup", None)
-    return await message.answer(text, reply_markup=mk_markup(kb), **kwargs)
-
-async def edit_text_with_kb(message, text, kb=None, **kwargs):
-    kwargs.pop("reply_markup", None)
-    return await message.edit_text(text, reply_markup=mk_markup(kb), **kwargs)
-
-from telegram_meeting_bot.ui.texts import (
-    menu_text_for, show_help_text, render_active_text,
-)
-
-from aiogram.types import InlineKeyboardMarkup as AInlineKeyboardMarkup, InlineKeyboardButton as AInlineKeyboardButton
-
-def mk_markup(kb):
-    """
-    Convert legacy PTB InlineKeyboardMarkup to aiogram InlineKeyboardMarkup if needed.
-    Accepts aiogram markup, PTB-like objects with .inline_keyboard, or dicts.
-    """
-    if kb is None:
-        return None
-    if isinstance(kb, AInlineKeyboardMarkup):
-        return kb
-    # PTB-like
-    try:
-        rows = []
-        inline = getattr(kb, "inline_keyboard", None)
-        if inline:
-            for row in inline:
-                new_row = []
-                for btn in row:
-                    text = getattr(btn, "text", "")
-                    cd = getattr(btn, "callback_data", None)
-                    url = getattr(btn, "url", None)
-                    if cd is not None:
-                        new_row.append(AInlineKeyboardButton(text=text, callback_data=cd))
-                    elif url:
-                        new_row.append(AInlineKeyboardButton(text=text, url=url))
-                if new_row:
-                    rows.append(new_row)
-            if rows:
-                return AInlineKeyboardMarkup(inline_keyboard=rows)
-    except Exception:
-        pass
-    # Dict-like
-    try:
-        if isinstance(kb, dict) and "inline_keyboard" in kb:
-            # assume aiogram-compatible structure
-            return AInlineKeyboardMarkup(inline_keyboard=[
-                [
-                    (AInlineKeyboardButton(text=b.get("text",""), callback_data=b.get("callback_data"))
-                     if "callback_data" in b else
-                     AInlineKeyboardButton(text=b.get("text",""), url=b.get("url"))
-                    )
-                    for b in row
-                ] for row in kb["inline_keyboard"]
-            ])
-    except Exception:
-        pass
-    # Fallback: nothing
-    return None
-
-async def answer_with_kb(message, text, kb=None, **kwargs):
-    kwargs.pop("reply_markup", None)
-    return await message.answer(text, reply_markup=mk_markup(kb), **kwargs)
-
-async def edit_text_with_kb(message, text, kb=None, **kwargs):
-    kwargs.pop("reply_markup", None)
-    return await message.edit_text(text, reply_markup=mk_markup(kb), **kwargs)
-
-
-from telegram_meeting_bot.ui import keyboards as ui_kb, texts as ui_txt
+from telegram_meeting_bot.core import constants, storage
 from telegram_meeting_bot.core.parsing import parse_meeting_message
+from telegram_meeting_bot.ui import keyboards as ui_kb, texts as ui_txt
+
 
 logger = logging.getLogger("reminder-bot.aiogram")
 
-def is_admin_user(user) -> bool:
-    try:
-        from telegram_meeting_bot.core.storage import get_admin_usernames
-        admins = {a.lower().lstrip('@') for a in get_admin_usernames()}
-        uname = (user.username or '').lower().lstrip('@')
-        return bool(uname) and uname in admins
-    except Exception as e:
-        return False
-
-
 router = Router()
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone=timezone.utc)
 
-# ======== Global in-memory helpers (anti-bounce etc.) ========
-_last_cb_ts_by_user: dict[int, float] = {}
+STATE_AWAIT_TZ = "await_tz"
+STATE_AWAIT_ADMIN_ADD = "await_admin"
+STATE_AWAIT_ADMIN_DEL = "await_admin_del"
+STATE_PENDING = "pending_reminders"
+
 
 class ErrorsMiddleware:
-    async def __call__(self, handler, event, data):
+    async def __call__(self, handler, event, data):  # type: ignore[override]
         try:
             return await handler(event, data)
-        except Exception as e:
-            logger.exception("Unhandled error: %s", e)
-            try:
-                # Try to answer gracefully if it's a message
-                if hasattr(event, "answer"):
-                    await event.answer("⚠️ Произошла ошибка. Уже разбираюсь.")
-            except Exception:
-                pass
+        except Exception as exc:  # pragma: no cover - defensive layer
+            logger.exception("Unhandled error", exc_info=exc)
+            message = getattr(event, "message", None)
+            if isinstance(message, Message):
+                with suppress(Exception):
+                    await message.answer("⚠️ Что-то пошло не так. Уже разбираюсь.")
             return None
 
-
-# ========= Helpers =========
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
-async def _send_safe(bot: Bot, chat_id: int | str, text: str, message_thread_id: Optional[int] = None):
+
+def _is_admin(user: Optional[User]) -> bool:
+    if user is None:
+        return False
+    if user.id in constants.ADMIN_IDS:
+        return True
+    username = (user.username or "").lower().lstrip("@")
+    if not username:
+        return False
+    if username in constants.ADMIN_USERNAMES:
+        return True
+    owners = getattr(constants, "OWNER_USERNAMES", {"panykovc"})
+    return username in owners or username == "panykovc"
+
+
+def _is_owner(user: Optional[User]) -> bool:
+    if user is None:
+        return False
+    username = (user.username or "").lower().lstrip("@")
+    owners = getattr(constants, "OWNER_USERNAMES", {"panykovc"})
+    return username in owners or _is_admin(user)
+
+
+def _paginate_jobs(page: int, page_size: int) -> tuple[list[Dict[str, Any]], int, int]:
+    jobs = storage.get_jobs_store()
+    total = len(jobs)
+    pages_total = max(1, (total + page_size - 1) // page_size)
+    page = max(1, min(page, pages_total))
+    start = (page - 1) * page_size
+    chunk = jobs[start : start + page_size]
+    return chunk, total, pages_total
+
+
+def _schedule_job(job_id: str, run_at: datetime) -> None:
+    scheduler.add_job(
+        send_reminder_job,
+        trigger=DateTrigger(run_date=run_at.astimezone(timezone.utc)),
+        id=job_id,
+        kwargs={"job_id": job_id},
+        replace_existing=True,
+    )
+
+
+async def _send_safe(bot: Bot, chat_id: int | str, text: str, *, message_thread_id: Optional[int] = None) -> None:
     try:
         await bot.send_message(chat_id=chat_id, text=text, message_thread_id=message_thread_id)
-    except Exception as e:
-        logger.exception("send_message failed: %s", e)
+    except TelegramBadRequest as exc:
+        if "kicked" in str(exc).lower():
+            logger.warning("Bot removed from chat %s", chat_id)
+        else:
+            logger.warning("Failed to send message: %s", exc)
+    except Exception:  # pragma: no cover - network failures
+        logger.exception("send_message failed")
 
-# ========= Commands =========
+
+def _apply_offset(dt: datetime, minutes: int) -> datetime:
+    return dt - timedelta(minutes=minutes)
+
+
+def _resolve_target_title(target_chat_id: int | str) -> str:
+    for known in storage.get_known_chats():
+        if str(known.get("chat_id")) == str(target_chat_id):
+            title = known.get("title")
+            if title:
+                return title
+    return str(target_chat_id)
+
+
+def _debounce(user_id: int, cooldown: float = 0.75) -> bool:
+    now = time.monotonic()
+    last = _debounce.cache.get(user_id, 0.0)
+    if now - last < cooldown:
+        return False
+    _debounce.cache[user_id] = now
+    return True
+
+
+_debounce.cache: dict[int, float] = {}
+
+async def _ensure_known_chat(message: Message) -> None:
+    chat = message.chat
+    if chat.type in {"group", "supergroup"}:
+        title = chat.title or (chat.username and f"@{chat.username}") or str(chat.id)
+        storage.register_chat(chat.id, title, topic_id=message.message_thread_id)
+
+
+async def _pick_target_for_private(message: Message, state: FSMContext, text: str) -> bool:
+    user = message.from_user
+    if user is None:
+        return False
+    candidates: list[Dict[str, Any]] = []
+    for candidate in storage.get_known_chats():
+        chat_id = candidate.get("chat_id")
+        try:
+            member = await message.bot.get_chat_member(chat_id, user.id)
+        except Exception:
+            continue
+        if member.status not in {"left", "kicked"}:
+            candidates.append(candidate)
+    if not candidates:
+        return False
+    token = uuid.uuid4().hex
+    data = await state.get_data()
+    pending = dict(data.get(STATE_PENDING, {}))
+    pending[token] = {"text": text}
+    await state.update_data({STATE_PENDING: pending})
+    candidates.append({"chat_id": message.chat.id, "title": "Личный чат"})
+    await message.answer("📨 Куда отправить напоминание?", reply_markup=ui_kb.choose_chat_kb(candidates, token))
+    return True
+
+
+async def schedule_reminder(
+    *,
+    message: Message,
+    source_chat_id: int,
+    target_chat_id: int | str,
+    user: Optional[User],
+    text: str,
+    topic_id: Optional[int] = None,
+) -> None:
+    tz = storage.resolve_tz_for_chat(int(target_chat_id) if isinstance(target_chat_id, int) else source_chat_id)
+    parsed = parse_meeting_message(text, tz)
+    if not parsed:
+        await message.answer(
+            "🙈 Не понял формат. Жду: `ДД.ММ ТИП ЧЧ:ММ ПЕРЕГ НОМЕР`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if storage.find_job_by_text(parsed["reminder_text"]):
+        await message.answer("⚠️ Такая напоминалка уже есть.")
+        return
+
+    offset_minutes = storage.get_offset_for_chat(
+        int(target_chat_id) if isinstance(target_chat_id, int) else source_chat_id
+    )
+    reminder_local = _apply_offset(parsed["dt_local"], offset_minutes)
+    reminder_utc = reminder_local.astimezone(timezone.utc)
+    now_utc = _utc_now()
+
+    job_id = f"rem-{uuid.uuid4().hex}"
+    job_data = {
+        "job_id": job_id,
+        "target_chat_id": target_chat_id,
+        "topic_id": topic_id,
+        "text": parsed["reminder_text"],
+        "source_chat_id": source_chat_id,
+        "target_title": _resolve_target_title(target_chat_id),
+        "author_id": getattr(user, "id", None),
+        "author_username": getattr(user, "username", None),
+        "created_at_utc": now_utc.isoformat(),
+        "signature": f"{target_chat_id}:{parsed['canonical_full']}",
+        "rrule": constants.RR_ONCE,
+        "run_at_utc": reminder_utc.isoformat(),
+    }
+
+    if reminder_utc <= now_utc:
+        await _send_safe(message.bot, target_chat_id, job_data["text"], message_thread_id=topic_id)
+        await message.answer("✅ Напоминание уже должно было прийти — отправил сразу.")
+        return
+
+    _schedule_job(job_id, reminder_utc)
+    storage.add_job_record(job_data)
+    await message.answer(
+        f"📌 Запланировано на {reminder_local:%d.%m %H:%M}\n{parsed['canonical_full']}",
+        reply_markup=ui_kb.job_kb(job_id) if _is_admin(user) else None,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+def _render_active(chunk: Iterable[Dict[str, Any]], total: int, page: int, pages_total: int, user: Optional[User]) -> tuple[str, InlineKeyboardMarkup]:
+    admin = _is_admin(user)
+    text = ui_txt.render_active_text(list(chunk), total, page, pages_total, admin)
+    kb = ui_kb.active_kb(list(chunk), page, pages_total, uid=user.id if user else 0, is_admin=admin)
+    return text, kb
+
+
+async def _show_active(message: Message, user: Optional[User], *, page: int = 1) -> None:
+    chunk, total, pages_total = _paginate_jobs(page, constants.PAGE_SIZE or 10)
+    text, kb = _render_active(chunk, total, page, pages_total, user)
+    if message:
+        try:
+            await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except TelegramBadRequest:
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def _show_settings(message: Message, user: Optional[User], state: FSMContext) -> None:
+    await state.update_data({STATE_AWAIT_TZ: False, STATE_AWAIT_ADMIN_ADD: False, STATE_AWAIT_ADMIN_DEL: False})
+    kb = ui_kb.settings_menu_kb(_is_owner(user))
+    text = "⚙️ Настройки"
+    try:
+        await message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await message.answer(text, reply_markup=kb)
+
+
+async def _show_chats(message: Message) -> None:
+    known = storage.get_known_chats()
+    kb = ui_kb.chats_menu_kb(known)
+    text = "📋 Зарегистрированные чаты"
+    try:
+        await message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await message.answer(text, reply_markup=kb)
+
+
+async def _show_admins(message: Message) -> None:
+    admins = constants.ADMIN_USERNAMES
+    text = ui_txt.render_admins_text(admins)
+    kb = ui_kb.admins_menu_kb(admins)
+    try:
+        await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    except TelegramBadRequest:
+        await message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+
+def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        return storage.get_job_record(job_id)
+    except Exception:
+        logger.exception("Failed to load job %s", job_id)
+        return None
+
+
+def _remove_job(job_id: str) -> None:
+    storage.remove_job_record(job_id)
+    with suppress(Exception):
+        scheduler.remove_job(job_id)
+
+
+async def _open_actions(message: Message, user: Optional[User], job_id: str) -> None:
+    job = _get_job(job_id)
+    if not job:
+        await message.answer("Не найдено")
+        return
+    label = job.get("text", "напоминание")
+    kb = ui_kb.actions_kb(job_id, is_admin=_is_admin(user))
+    text = f"⚙️ Действия для «{label}»"
+    try:
+        await message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await message.answer(text, reply_markup=kb)
+
+
+def _update_job_time(job: Dict[str, Any], new_run: datetime) -> None:
+    job["run_at_utc"] = new_run.astimezone(timezone.utc).isoformat()
+    storage.upsert_job_record(job["job_id"], {"run_at_utc": job["run_at_utc"]})
+    _schedule_job(job["job_id"], new_run)
+
+async def send_reminder_job(job_id: str | None = None, **_: Any) -> None:
+    if not job_id:
+        return
+    bot: Bot = send_reminder_job.bot  # type: ignore[attr-defined]
+    job = _get_job(job_id)
+    if not job:
+        return
+    await _send_safe(bot, job.get("target_chat_id"), job.get("text", ""), message_thread_id=job.get("topic_id"))
+    rrule = job.get("rrule", constants.RR_ONCE)
+    run_iso = job.get("run_at_utc")
+    try:
+        run_at = datetime.fromisoformat(run_iso) if run_iso else _utc_now()
+        if run_at.tzinfo is None:
+            run_at = run_at.replace(tzinfo=timezone.utc)
+    except Exception:
+        run_at = _utc_now()
+    if rrule == constants.RR_DAILY:
+        next_run = run_at + timedelta(days=1)
+        _update_job_time(job, next_run)
+    elif rrule == constants.RR_WEEKLY:
+        next_run = run_at + timedelta(weeks=1)
+        _update_job_time(job, next_run)
+    else:
+        _remove_job(job_id)
+
+
+def restore_jobs() -> None:
+    now = _utc_now()
+    for job in storage.get_jobs_store():
+        job_id = job.get("job_id")
+        if not job_id:
+            continue
+        run_iso = job.get("run_at_utc")
+        try:
+            run_at = datetime.fromisoformat(run_iso)
+            if run_at.tzinfo is None:
+                run_at = run_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        delay = (run_at - now).total_seconds()
+        if delay <= 0 and delay >= -constants.CATCHUP_WINDOW_SECONDS:
+            asyncio.create_task(send_reminder_job(job_id))
+        elif delay > 0:
+            _schedule_job(job_id, run_at)
+
+# === Commands ===
+
 
 @router.message(Command("start"))
-async def cmd_start(m: Message, state: FSMContext):
-    # Use existing texts/menus if present, else fallback simple
-    try:
-        text = menu_text_for(m.chat.id)
-    except Exception:
-        text = "Привет! Я бот напоминаний. Напиши запрос в формате: ДД.ММ ТИП ЧЧ:ММ ПЕРЕГ НОМЕР"
-    try:
-        kb = main_menu_kb(constants.is_admin(m.from_user)) if hasattr(constants,'is_admin') else main_menu_kb(False)
-    except Exception:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Меню", callback_data="menu:open")]
-        ])
-    await answer_with_kb(m, text, kb=(main_menu_kb(constants.is_admin(m.from_user)) if hasattr(constants,'is_admin') else main_menu_kb(False)))
+async def cmd_start(message: Message) -> None:
+    user = message.from_user
+    text = ui_txt.menu_text_for(message.chat.id)
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=ui_kb.main_menu_kb(_is_admin(user)))
+
 
 @router.message(Command("help"))
-async def cmd_help(m: Message):
-    try:
-        text = show_help_text()
-    except Exception:
-        text = "Справка по форматам и функциям бота."
-    await m.answer(text)
+async def cmd_help(message: Message) -> None:
+    user = message.from_user
+    text = ui_txt.show_help_text()
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=ui_kb.main_menu_kb(_is_admin(user)))
+
 
 @router.message(Command("menu"))
+async def cmd_menu(message: Message) -> None:
+    await cmd_start(message)
 
-@router.message(F.text.in_({'📅 Мои встречи', 'Мои встречи'}))
-async def btn_my_meetings(m: Message):
-    user = m.from_user
-    all_jobs = storage.get_jobs_store()
-    total = len(all_jobs)
-    page_size = getattr(constants, "PAGE_SIZE", 10) or 10
-    pages_total = max(1, (total + page_size - 1)//page_size)
-    page = 1
-    chunk = all_jobs[:page_size]
-    admin = is_admin_user(user)
-    text = render_active_text(chunk, total, page, pages_total, admin)
-    kb = active_kb(chunk, page, pages_total, uid=user.id, is_admin=admin)
-    await answer_with_kb(m, text, kb=kb, parse_mode="HTML")
 
-@router.message(F.text.in_({'➕ Создать встречу', 'Создать встречу'}))
-async def btn_create(m: Message):
-    example = "Пример: 08.08 МТС 20:40 2в 88634"
-    await m.answer(f"Отправь строку встречи в формате\n{example}")
-
-@router.message(F.text.in_({'⚙️ Настройки', 'Настройки'}))
-async def btn_settings(m: Message):
-    await answer_with_kb(m, "Настройки:", kb=settings_menu_kb(), parse_mode="HTML")
+@router.message(Command("register"))
+async def cmd_register(message: Message) -> None:
+    await _ensure_known_chat(message)
+    await message.answer("Чат зарегистрирован ✅")
 
 
 @router.message(Command("purge"))
-async def cmd_purge(m: Message):
-    try:
-        is_admin = is_admin_user(m.from_user)
-        if not is_admin:
-            await m.answer("Только для админов.")
-            return
-        storage.set_jobs_store([])
-        await m.answer("База напоминаний очищена ✅")
-    except Exception as e:
-        logger.exception("purge failed: %s", e)
-        await m.answer("Не удалось очистить БД.")
-
-async def cmd_menu(m: Message):
-    try:
-        text, kb = menu_text_for(m.chat.id), main_menu_kb(constants.is_admin(m.from_user)) if hasattr(constants,'is_admin') else main_menu_kb(False)
-    except Exception:
-        text, kb = "Главное меню", None
-    await answer_with_kb(m, text, kb=(main_menu_kb(constants.is_admin(m.from_user)) if hasattr(constants,'is_admin') else main_menu_kb(False)))
-
-@router.message(Command("register"))
-async def cmd_register(m: Message):
-    topic_id = getattr(m, "message_thread_id", None)
-    storage.register_chat(m.chat.id, m.chat.title or "", topic_id=topic_id, topic_title=None)
-    await m.answer("Чат зарегистрирован ✅")
-
-# ========= Plain text in private =========
-
-
-@router.message(F.chat.type == "private", F.text & ~F.text.startswith("/"))
-async def handle_private_text(m: Message, state: FSMContext):
-    text_in = (m.text or "").strip()
-
-    # Admin add/del flows
-    data = await state.get_data()
-    if data.get("await_admin"):
-        uname = text_in.lstrip("@").strip()
-        from telegram_meeting_bot.core.storage import add_admin_username
-        ok = add_admin_username(uname)
-        await state.update_data(await_admin=False)
-        await m.answer("Админ добавлен ✅" if ok else "Уже был в списке")
+async def cmd_purge(message: Message) -> None:
+    if not _is_admin(message.from_user):
+        await message.answer("Только для админов.")
         return
-    if data.get("await_admin_del"):
-        uname = text_in.lstrip("@").strip()
-        from telegram_meeting_bot.core.storage import remove_admin_username
-        ok = remove_admin_username(uname)
-        await state.update_data(await_admin_del=False)
-        await m.answer("Удалён ✅" if ok else "Не найден в списке")
+    storage.set_jobs_store([])
+    scheduler.remove_all_jobs()
+    await message.answer("База напоминаний очищена ✅")
+
+# === Text handlers ===
+
+
+@router.message(F.chat.type == "private", F.text)
+async def handle_private_text(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if not text or text.startswith("/"):
         return
 
-    # AWAIT_TZ flow
     data = await state.get_data()
-    if data.get("await_tz"):
-        import pytz
+    if data.get(STATE_AWAIT_TZ):
         try:
-            pytz.timezone(text_in)
+            pytz.timezone(text)
         except Exception:
-            await m.answer("Некорректная TZ. Пример: `Europe/Moscow`", parse_mode="HTML")
+            await message.answer("Некорректная TZ. Пример: `Europe/Moscow`", parse_mode=ParseMode.MARKDOWN)
             return
-        cfg = storage.get_cfg()
-        cfg["tz"] = text_in
-        storage.set_cfg(cfg)
-        await state.update_data(await_tz=False)
-        await m.answer(f"TZ обновлена: `{text_in}`", parse_mode="HTML")
+        storage.update_chat_cfg(message.chat.id, tz=text)
+        await state.update_data({STATE_AWAIT_TZ: False})
+        await message.answer(f"TZ обновлена: `{text}`", parse_mode=ParseMode.MARKDOWN)
         return
 
-    # Parse meeting line
-    from tzlocal import get_localzone
-    tz = get_localzone()
-    parsed = parse_meeting_message(text_in, tz)
-    if not parsed:
-        await m.answer("Не распознал формат. Пример: 08.08 МТС 20:40 2в 88634")
+    if data.get(STATE_AWAIT_ADMIN_ADD):
+        await state.update_data({STATE_AWAIT_ADMIN_ADD: False})
+        if not _is_owner(message.from_user):
+            await message.answer("Только владелец может управлять админами.")
+            return
+        username = text.lstrip("@").lower()
+        if not username:
+            await message.answer("Нужен логин вида @username")
+            return
+        added = storage.add_admin_username(username)
+        await message.answer("✅ Добавлен" if added else "⚠️ Уже в списке")
         return
 
-    # Choose target chat: default from cfg or "this chat" (0)
-    cfg = storage.get_cfg()
-    target_chat_id = cfg.get("default_target_chat_id") or 0
-    if target_chat_id == 0:
-        target_chat_id = m.chat.id
+    if data.get(STATE_AWAIT_ADMIN_DEL):
+        await state.update_data({STATE_AWAIT_ADMIN_DEL: False})
+        removed = storage.remove_admin_username(text.lstrip("@"))
+        await message.answer("✅ Удалён" if removed else "⚠️ Не найден")
+        return
 
-    rec = {
-        "job_id": parsed.get("signature") or None,
-        "source_chat_id": m.chat.id,
-        "target_chat_id": target_chat_id,
-        "topic_id": None,
-        "text": constants.REMINDER_TEMPLATE.format(
-            date=parsed.get("date_str"),
-            type=parsed.get("meeting_type"),
-            time=parsed.get("time_str"),
-            room=parsed.get("room"),
-            ticket=parsed.get("ticket"),
-        ),
-        "run_at_utc": parsed["dt_local"].astimezone(timezone.utc).timestamp(),
-    }
-    storage.upsert_job_record(rec)
-    run_at = datetime.fromtimestamp(rec["run_at_utc"], tz=timezone.utc)
-    scheduler.add_job(send_reminder_job, trigger=DateTrigger(run_date=run_at), kwargs={"job_id": rec.get("job_id")}, id=str(rec.get("job_id") or f"ts{int(run_at.timestamp())}"), replace_existing=True)
-    await m.answer(f"Напоминание на {parsed['date_str']} {parsed['time_str']} создано ✅")
+    if await _pick_target_for_private(message, state, text):
+        return
+
+    await schedule_reminder(
+        message=message,
+        source_chat_id=message.chat.id,
+        target_chat_id=message.chat.id,
+        user=message.from_user,
+        text=text,
+        topic_id=message.message_thread_id,
+    )
 
 
-# ========= Callback handlers (stubs to be wired to your existing callback_data) =========
+@router.message(F.chat.type.in_({"group", "supergroup"}), F.text)
+async def handle_group_text(message: Message) -> None:
+    if not message.text or message.text.startswith("/"):
+        return
+    await _ensure_known_chat(message)
+    await schedule_reminder(
+        message=message,
+        source_chat_id=message.chat.id,
+        target_chat_id=message.chat.id,
+        user=message.from_user,
+        text=message.text.strip(),
+        topic_id=message.message_thread_id,
+    )
 
-@router.callback_query(F.data.startswith("menu:"))
-async def cb_menu(q: CallbackQuery):
-    try:
-        text, kb = menu_text_for(m.chat.id), main_menu_kb(constants.is_admin(m.from_user)) if hasattr(constants,'is_admin') else main_menu_kb(False)
-    except Exception:
-        text, kb = "Главное меню", None
-    if q.message:
-        await q.message.edit_text(text, reply_markup=kb)
-    await q.answer()
+# === Callback handling ===
 
 
 @router.callback_query()
-async def callbacks_router(q: CallbackQuery, state: FSMContext):
-    import time, pytz
-    data = q.data or ""
-    user = q.from_user
-    chat_id = q.message.chat.id if q.message else 0
+async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
+    data = query.data or ""
+    user = query.from_user
+    message = query.message
 
-    # Anti-bounce: ignore same-user callbacks faster than 0.75s
-    now_ts = time.monotonic()
-    last = _last_cb_ts_by_user.get(user.id, 0.0)
-    if now_ts - last < 0.75 and data != getattr(constants, 'CB_NOOP', getattr(constants, 'CB_DISABLED', 'noop')):
-        try:
-            await q.answer("⏳ Уже выполняю…", cache_time=1)
-        except Exception:
-            pass
-        return
-    _last_cb_ts_by_user[user.id] = now_ts
-
-    def safe_edit(text, kb=None):
-        return q.message.edit_text(text, reply_markup=kb) if q.message else q.answer()
-
-    # NOOP
-    if data == getattr(constants, "CB_NOOP", "noop"):
-        try:
-            await q.answer("⏳ Уже выполняю…", cache_time=1)
-        except Exception:
-            pass
+    if data != constants.CB_NOOP and not _debounce(user.id):
+        with suppress(Exception):
+            await query.answer("⏳ Уже выполняю…", cache_time=1)
         return
 
-    # MENU / HELP / SETTINGS
+    if data == constants.CB_NOOP:
+        with suppress(Exception):
+            await query.answer("⏳ Уже выполняю…", cache_time=1)
+        return
+
     if data == constants.CB_MENU:
-        await safe_edit(menu_text_for(chat_id), main_menu_kb(is_admin_user(user)))
-        await q.answer()
+        text = ui_txt.menu_text_for(message.chat.id)
+        kb = ui_kb.main_menu_kb(_is_admin(user))
+        try:
+            await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except TelegramBadRequest:
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        await query.answer()
         return
 
     if data == constants.CB_HELP:
-        await safe_edit(show_help_text())
-        await q.answer()
+        text = ui_txt.show_help_text()
+        kb = ui_kb.main_menu_kb(_is_admin(user))
+        try:
+            await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except TelegramBadRequest:
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        await query.answer()
         return
 
     if data == constants.CB_SETTINGS:
-        # Show settings keyboard (TZ / offset / chats / admins)
-        try:
-            await safe_edit(show_help_text(), settings_menu_kb())
-        except Exception:
-            await q.message.answer(show_help_text(), reply_markup=settings_menu_kb())
-        await q.answer()
+        await _show_settings(message, user, state)
+        await query.answer()
         return
 
-    # Active list & paging
-    if data == constants.CB_ACTIVE or data.startswith(constants.CB_ACTIVE_PAGE + ":"):
-        import math
+    if data == constants.CB_ACTIVE or data.startswith(f"{constants.CB_ACTIVE_PAGE}:"):
         page = 1
         if ":" in data:
             try:
-                page = int(data.split(":")[1])
-            except Exception:
+                page = int(data.split(":", 1)[1])
+            except ValueError:
                 page = 1
-        all_jobs = storage.get_jobs_store()
-        total = len(all_jobs)
-        page_size = getattr(constants, "PAGE_SIZE", 10) or 10
-        pages_total = max(1, math.ceil(total / page_size))
-        page = max(1, min(page, pages_total))
-        start = (page - 1) * page_size
-        chunk = all_jobs[start:start+page_size]
-        is_admin = is_admin_user(user)
-        text = render_active_text(chunk, total, page, pages_total, is_admin)
-        kb = active_kb(chunk, page, pages_total, uid=user.id, is_admin=is_admin)
-        try:
-            await edit_text_with_kb(q.message, text, kb=kb, parse_mode="HTML")
-        except Exception:
-            await answer_with_kb(q.message, text, kb=kb, parse_mode="HTML")
-        await q.answer()
+        await _show_active(message, user, page=page)
+        await query.answer()
         return
 
-
-    # TZ flows
     if data == constants.CB_SET_TZ:
-        await edit_text_with_kb(q.message, "Выбери вариант TZ или введи свою:", kb=tz_menu_kb(), parse_mode="HTML")
-        await q.answer()
+        kb = ui_kb.tz_menu_kb()
+        try:
+            await message.edit_text("Выберите таймзону", reply_markup=kb)
+        except TelegramBadRequest:
+            await message.answer("Выберите таймзону", reply_markup=kb)
+        await query.answer()
         return
 
     if data == constants.CB_SET_TZ_LOCAL:
-        await state.update_data(await_tz=True)
-        await q.message.edit_text("Введи TZ (например, `Europe/Moscow`)", parse_mode="HTML")
-        await q.answer()
+        tz_name = get_localzone_name()
+        storage.update_chat_cfg(message.chat.id, tz=tz_name)
+        await message.answer(f"TZ обновлена: {tz_name}")
+        await query.answer()
         return
 
-    if data in (getattr(constants, "CB_SET_TZ_MOSCOW", "set_tz_eu_msk"), getattr(constants, "CB_SET_TZ_CHICAGO", "set_tz_us_chi")):
-        tz_map = {
-            getattr(constants, "CB_SET_TZ_MOSCOW", "set_tz_eu_msk"): "Europe/Moscow",
-            getattr(constants, "CB_SET_TZ_CHICAGO", "set_tz_us_chi"): "America/Chicago",
-        }
-        tzname = tz_map.get(data)
-        cfg = storage.get_cfg()
-        cfg["tz"] = tzname
-        storage.set_cfg(cfg)
-        await q.answer("TZ обновлена")
+    if data == constants.CB_SET_TZ_MOSCOW:
+        storage.update_chat_cfg(message.chat.id, tz="Europe/Moscow")
+        await message.answer("TZ обновлена: Europe/Moscow")
+        await query.answer()
         return
 
-    # OFFSETS
+    if data == constants.CB_SET_TZ_CHICAGO:
+        storage.update_chat_cfg(message.chat.id, tz="America/Chicago")
+        await message.answer("TZ обновлена: America/Chicago")
+        await query.answer()
+        return
+
+    if data == constants.CB_SET_TZ_ENTER:
+        await state.update_data({STATE_AWAIT_TZ: True})
+        await message.answer("Введи название таймзоны, например `Europe/Moscow`", parse_mode=ParseMode.MARKDOWN)
+        await query.answer()
+        return
+
     if data == constants.CB_SET_OFFSET:
-        cfg = storage.get_cfg()
-        off = int(cfg.get("offset_minutes", 0))
-        await edit_text_with_kb(q.message, f"Текущий offset: {off} мин", kb=offset_menu_kb(off), parse_mode="HTML")
-        await q.answer()
-        return
-
-    if data in (constants.CB_OFF_INC, constants.CB_OFF_DEC):
-        cfg = storage.get_cfg()
-        off = int(cfg.get("offset_minutes", 0))
-        off += 10 if data == constants.CB_OFF_INC else -10
-        storage.set_cfg({"offset_minutes": off})
-        await q.message.edit_reply_markup(reply_markup=mk_markup(offset_menu_kb(off)))
-        await q.answer("Ок")
-        return
-
-    # CHATS mgmt
-    if data == constants.CB_CHATS:
-        chats = storage.get_chats()
-        await edit_text_with_kb(q.message, "Зарегистрированные чаты/темы:", kb=chats_menu_kb(chats), parse_mode="HTML")
-        await q.answer()
-        return
-
-    if data.startswith(constants.CB_CHAT_DEL + ":"):
-        _, raw = data.split(":", 1)
+        kb = ui_kb.offset_menu_kb()
         try:
-            cid, tid = raw.split(",", 1)
-            storage.unregister_chat(int(cid), int(tid) if tid != "0" else None)
-        except Exception:
-            pass
-        chats = storage.get_chats()
-        await edit_text_with_kb(q.message, "Зарегистрированные чаты/темы:", kb=chats_menu_kb(chats), parse_mode="HTML")
-        await q.answer("Удалено")
+            await message.edit_text("⏳ Выберите оффсет", reply_markup=kb)
+        except TelegramBadRequest:
+            await message.answer("⏳ Выберите оффсет", reply_markup=kb)
+        await query.answer()
         return
 
-    # ADMINS list/add/del
-    if data == getattr(constants, "CB_ADMINS", "admins"):
-        from telegram_meeting_bot.core.constants import ADMIN_USERNAMES
-        await edit_text_with_kb(q.message, "Администраторы:", kb=admins_menu_kb(ADMIN_USERNAMES), parse_mode="HTML")
-        await q.answer()
-        return
-
-    if data == getattr(constants, "CB_ADMIN_ADD", "admin_add"):
-        await state.update_data(await_admin=True)
-        await q.message.edit_text("Введи @username для добавления в админы")
-        await q.answer()
-        return
-
-    if data == getattr(constants, "CB_ADMIN_DEL", "admin_del"):
-        await state.update_data(await_admin_del=True)
-        await q.message.edit_text("Введи @username для удаления из админов")
-        await q.answer()
-        return
-
-    # Actions panel open/close
-    if data.startswith(constants.CB_ACTIONS + ":"):
-        parts = data.split(":")
-        jid = parts[1] if len(parts) >= 2 else None
-        if len(parts) >= 3 and parts[2] == "close":
-            # back to page 1
-            all_jobs = storage.get_jobs_store()
-            total = len(all_jobs)
-            page_size = getattr(constants, "PAGE_SIZE", 10) or 10
-            pages_total = max(1, (total + page_size - 1)//page_size)
-            page = 1
-            chunk = all_jobs[:page_size]
-            is_admin = is_admin_user(user)
-            text = render_active_text(chunk, total, page, pages_total, is_admin)
-            kb = active_kb(chunk, page, pages_total, uid=user.id, is_admin=is_admin)
-            await edit_text_with_kb(q.message, text, kb=kb, parse_mode="HTML")
-            await q.answer()
-            return
-        rec = storage.get_job_record(jid)
-        if not rec:
-            await q.answer("Не найдено")
-            return
-        label = rec.get("text", "задача")
-        from telegram_meeting_bot.ui.keyboards import actions_kb
-        kb = actions_kb(jid, is_admin=is_admin_user(user))
-        await edit_text_with_kb(q.message, f"⚙️ Действия для «{label}»", kb=kb, parse_mode="HTML")
-        await q.answer()
-        return
-
-    # Send now / Cancel / Shift
-    if data.startswith(constants.CB_SENDNOW + ":"):
-        jid = data.split(":")[1]
-        await send_reminder_job(job_id=jid)
-        await q.answer("Отправлено")
-        return
-
-    if data.startswith(constants.CB_CANCEL + ":"):
-        jid = data.split(":")[1]
-        storage.remove_job_record(jid)
-        try:
-            scheduler.remove_job(jid)
-        except Exception:
-            pass
-        # refresh current view
-        all_jobs = storage.get_jobs_store()
-        total = len(all_jobs)
-        page_size = getattr(constants, "PAGE_SIZE", 10) or 10
-        pages_total = max(1, (total + page_size - 1)//page_size)
-        page = 1
-        chunk = all_jobs[:page_size]
-        is_admin = is_admin_user(user)
-        text = render_active_text(chunk, total, page, pages_total, is_admin)
-        kb = active_kb(chunk, page, pages_total, uid=user.id, is_admin=is_admin)
-        await edit_text_with_kb(q.message, text, kb=kb, parse_mode="HTML")
-        await q.answer("Отменено")
-        return
-
-    if data.startswith(constants.CB_SHIFT + ":"):
-        parts = data.split(":")
-        jid = parts[1]
-        minutes = int(parts[2]) if len(parts) >= 3 else 5
-        rec = storage.get_job_record(jid)
-        if not rec:
-            await q.answer("Не найдено")
-            return
-        new_ts = _to_ts(rec.get("run_at_utc", 0)) + minutes * 60
-        rec["run_at_utc"] = new_ts
-        storage.upsert_job_record(rec)
-        run_at = datetime.fromtimestamp(new_ts, tz=timezone.utc)
-        scheduler.add_job(send_reminder_job, trigger=DateTrigger(run_date=run_at), kwargs={"job_id": jid}, id=str(jid), replace_existing=True)
-        await q.answer(f"Сдвинул на +{minutes} мин")
-        return
-# ========= Jobs =========
-
-def _to_ts(v) -> int:
-    if isinstance(v, (int, float)):
-        return int(v)
-    if isinstance(v, str):
-        v = v.strip()
-        try:
-            return int(v)
-        except Exception:
-            try:
-                return int(float(v.replace(',', '.')))
-            except Exception:
-                return 0
-    return 0
-# ========= Jobs =========
-
-async def send_reminder_job(job_id: str | None = None, **kwargs):
-    """Execute reminder: load by job_id from storage and send."""
-    # Lazy import bot into job context:
-    bot: Bot = send_reminder_job.bot  # type: ignore[attr-defined]
-    if not job_id:
-        return
-    rec = storage.get_job_record(job_id)
-    if not rec:
-        return
-    await _send_safe(bot, rec["target_chat_id"], rec["text"], message_thread_id=rec.get("topic_id"))
-    # Remove after send if it's one-shot
-    storage.remove_job_record(job_id)
-
-def restore_jobs(sched: AsyncIOScheduler):
-    """Restore APScheduler jobs from storage at startup (with simple catch-up)."""
-    now = _utc_now()
-    for r in storage.get_jobs_store():
-        run_at = datetime.fromtimestamp(_to_ts(r.get("run_at_utc", 0)), tz=timezone.utc)
-        if run_at <= now:
-            # catch-up: send immediately in background
-            asyncio.create_task(send_reminder_job(job_id=r.get("job_id")))
+    if data in {constants.CB_OFF_DEC, constants.CB_OFF_INC} or data.startswith("off_p"):
+        entry = storage.get_chat_cfg_entry(message.chat.id)
+        current = int(entry.get("offset", 30))
+        if data == constants.CB_OFF_DEC:
+            current = max(0, current - 5)
+        elif data == constants.CB_OFF_INC:
+            current += 5
         else:
-            sched.add_job(send_reminder_job, trigger=DateTrigger(run_date=run_at), kwargs={"job_id": r.get("job_id")}, id=str(r.get("job_id")), replace_existing=True)
+            try:
+                current = int(data.split("_p")[-1])
+            except Exception:
+                current = 30
+        storage.update_chat_cfg(message.chat.id, offset=current)
+        await message.answer(f"⏳ Оффсет: {current} мин")
+        await query.answer()
+        return
 
-# ========= Lifecycle =========
+    if data == constants.CB_CHATS:
+        await _show_chats(message)
+        await query.answer()
+        return
 
-async def on_startup(bot: Bot):
-    try:
-        await bot.set_my_commands([
-            BotCommand(command="start", description="Приветствие и меню"),
-            BotCommand(command="menu", description="Главное меню"),
-            BotCommand(command="help", description="Подсказка"),
-            BotCommand(command="register", description="Зарегистрировать чат/тему"),
-        ])
-    except Exception as e:
-        logger.warning("set_my_commands failed: %s", e)
-    send_reminder_job.bot = bot  # provide bot to job
-    scheduler.start()
-    restore_jobs(scheduler)
-    # ensure default admin
-    try:
-        from telegram_meeting_bot.core.storage import add_admin_username
-        add_admin_username('panykovc')
-    except Exception as e:
-        logger.warning('cannot add default admin: %s', e)
-    logger.info("startup complete")
+    if data.startswith(f"{constants.CB_CHAT_DEL}:"):
+        parts = data.split(":")
+        chat_id = parts[1] if len(parts) > 1 else None
+        topic_id = int(parts[2]) if len(parts) > 2 else 0
+        if chat_id is not None:
+            storage.unregister_chat(chat_id, topic_id if topic_id else None)
+            await _show_chats(message)
+        await query.answer("Удалено")
+        return
 
-async def on_shutdown():
-    scheduler.shutdown(wait=False)
-    logger.info("shutdown complete")
+    if data == constants.CB_ADMINS:
+        await _show_admins(message)
+        await query.answer()
+        return
 
-async def main():
+    if data == constants.CB_ADMIN_ADD:
+        await state.update_data({STATE_AWAIT_ADMIN_ADD: True})
+        await message.answer("Введи @username для добавления")
+        await query.answer()
+        return
+
+    if data.startswith(f"{constants.CB_ADMIN_DEL}:"):
+        username = data.split(":", 1)[1]
+        removed = storage.remove_admin_username(username)
+        await message.answer("✅ Удалён" if removed else "⚠️ Не найден")
+        await query.answer()
+        return
+
+    if data.startswith(f"{constants.CB_PICK_CHAT}:"):
+        parts = data.split(":")
+        if len(parts) < 4:
+            await query.answer("Некорректные данные", show_alert=True)
+            return
+        chat_id_raw, topic_raw, token = parts[1], parts[2], parts[3]
+        try:
+            chat_id = int(chat_id_raw)
+        except ValueError:
+            chat_id = chat_id_raw
+        topic_id = int(topic_raw) if topic_raw and topic_raw != "0" else None
+        data_state = await state.get_data()
+        pending = dict(data_state.get(STATE_PENDING, {}))
+        entry = pending.pop(token, None)
+        await state.update_data({STATE_PENDING: pending})
+        if not entry:
+            await query.answer("Истекло", show_alert=True)
+            return
+        await schedule_reminder(
+            message=message,
+            source_chat_id=message.chat.id,
+            target_chat_id=chat_id,
+            user=user,
+            text=entry.get("text", ""),
+            topic_id=topic_id,
+        )
+        await query.answer("Готово")
+        return
+
+    if data.startswith(f"{constants.CB_ACTIONS}:"):
+        parts = data.split(":")
+        job_id = parts[1] if len(parts) > 1 else None
+        if len(parts) > 2 and parts[2] == "close":
+            await _show_active(message, user, page=1)
+            await query.answer()
+            return
+        if job_id:
+            await _open_actions(message, user, job_id)
+            await query.answer()
+            return
+
+    if data.startswith(f"{constants.CB_SENDNOW}:"):
+        job_id = data.split(":", 1)[1]
+        await send_reminder_job(job_id=job_id)
+        await query.answer("Отправлено")
+        return
+
+    if data.startswith(f"{constants.CB_CANCEL}:"):
+        job_id = data.split(":", 1)[1]
+        _remove_job(job_id)
+        await _show_active(message, user, page=1)
+        await query.answer("Удалено")
+        return
+
+    if data.startswith(f"{constants.CB_SHIFT}:"):
+        parts = data.split(":")
+        if len(parts) < 3:
+            await query.answer("Некорректные данные", show_alert=True)
+            return
+        job_id = parts[1]
+        try:
+            minutes = int(parts[2])
+        except ValueError:
+            minutes = 5
+        job = _get_job(job_id)
+        if not job:
+            await query.answer("Не найдено", show_alert=True)
+            return
+        run_iso = job.get("run_at_utc")
+        try:
+            run_at = datetime.fromisoformat(run_iso) if run_iso else _utc_now()
+            if run_at.tzinfo is None:
+                run_at = run_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            run_at = _utc_now()
+        new_run = run_at + timedelta(minutes=minutes)
+        _update_job_time(job, new_run)
+        await query.answer(f"Сдвинуто на +{minutes} мин")
+        return
+
+    if data.startswith(f"{constants.CB_RRULE}:"):
+        await query.answer("Повторы пока недоступны", show_alert=True)
+        return
+
+    await query.answer("Неизвестная кнопка", show_alert=True)
+
+# === Lifecycle ===
+
+
+async def on_startup(bot: Bot) -> None:
+    commands = [
+        BotCommand(command="start", description="Приветствие"),
+        BotCommand(command="menu", description="Главное меню"),
+        BotCommand(command="help", description="Справка"),
+        BotCommand(command="register", description="Зарегистрировать чат"),
+    ]
+    with suppress(Exception):
+        await bot.set_my_commands(commands)
+    send_reminder_job.bot = bot  # type: ignore[attr-defined]
+    if not scheduler.running:
+        scheduler.start()
+    restore_jobs()
+    storage.add_admin_username("panykovc")
+    logger.info("Startup complete")
+
+
+async def on_shutdown() -> None:
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+    logger.info("Shutdown complete")
+
+
+async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     cfg = storage.get_cfg()
-    token = (cfg.get("token") if isinstance(cfg, dict) else None) or constants.BOT_TOKEN  # fallback if defined
+    token = (cfg.get("token") if isinstance(cfg, dict) else None) or constants.BOT_TOKEN
     if not token:
-        raise SystemExit("Token not configured. Put it into data/config.json as {'token':'...'}")
+        raise SystemExit("Token not configured")
     bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.middleware(ErrorsMiddleware())
     dp.callback_query.middleware(ErrorsMiddleware())
-    dp.startup.register(on_startup)
-    dp.startup.register(lambda: on_startup(bot))
-    dp.shutdown.register(on_shutdown)
     dp.include_router(router)
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
