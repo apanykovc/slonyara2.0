@@ -39,6 +39,23 @@ STATE_AWAIT_TZ = "await_tz"
 STATE_AWAIT_ADMIN_ADD = "await_admin"
 STATE_AWAIT_ADMIN_DEL = "await_admin_del"
 STATE_PENDING = "pending_reminders"
+STATE_REPLY_MENU_SHOWN = "reply_menu_shown"
+
+
+REPLY_MENU_ACTIONS = {
+    "menu": {"меню"},
+    "create": {"➕ создать встречу", "+ создать встречу", "🆕 создать встречу", "создать встречу"},
+    "my": {"📂 мои встречи", "мои встречи"},
+    "active": {"📝 активные", "активные"},
+    "settings": {"⚙️ настройки", "настройки"},
+    "help": {"❓ справка", "справка"},
+}
+
+REPLY_MENU_ALIASES = {
+    alias.casefold(): action
+    for action, aliases in REPLY_MENU_ACTIONS.items()
+    for alias in aliases
+}
 
 
 class ErrorsMiddleware:
@@ -150,6 +167,16 @@ async def _ensure_known_chat(message: Message) -> None:
     if chat.type in {"group", "supergroup"}:
         title = chat.title or (chat.username and f"@{chat.username}") or str(chat.id)
         storage.register_chat(chat.id, title, topic_id=message.message_thread_id)
+
+
+async def _ensure_reply_menu(message: Message, state: FSMContext) -> None:
+    if message.chat.type != "private":
+        return
+    data = await state.get_data()
+    if data.get(STATE_REPLY_MENU_SHOWN):
+        return
+    await message.answer("👇 Быстрые действия", reply_markup=ui_kb.reply_menu_kb())
+    await state.update_data({STATE_REPLY_MENU_SHOWN: True})
 
 
 async def _reset_interaction_state(
@@ -469,22 +496,24 @@ def restore_jobs() -> None:
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, state: FSMContext) -> None:
     user = message.from_user
     text = ui_txt.menu_text_for(message.chat.id)
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=ui_kb.main_menu_kb(_is_admin(user)))
+    await _ensure_reply_menu(message, state)
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
+async def cmd_help(message: Message, state: FSMContext) -> None:
     user = message.from_user
     text = ui_txt.show_help_text()
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=ui_kb.main_menu_kb(_is_admin(user)))
+    await _ensure_reply_menu(message, state)
 
 
 @router.message(Command("menu"))
-async def cmd_menu(message: Message) -> None:
-    await cmd_start(message)
+async def cmd_menu(message: Message, state: FSMContext) -> None:
+    await cmd_start(message, state)
 
 
 @router.message(Command("register"))
@@ -540,6 +569,37 @@ async def handle_private_text(message: Message, state: FSMContext) -> None:
         await state.update_data({STATE_AWAIT_ADMIN_DEL: False})
         removed = storage.remove_admin_username(text.lstrip("@"))
         await message.answer("✅ Удалён" if removed else "⚠️ Не найден")
+        return
+
+    await _ensure_reply_menu(message, state)
+
+    action = REPLY_MENU_ALIASES.get(text.casefold())
+    if action:
+        await _reset_interaction_state(state)
+        user = message.from_user
+        if action == "menu":
+            menu_text = ui_txt.menu_text_for(message.chat.id)
+            await message.answer(
+                menu_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=ui_kb.main_menu_kb(_is_admin(user)),
+            )
+        elif action == "create":
+            await _show_create_hint(message, user)
+        elif action == "my":
+            await _show_active(message, user, page=1, mine=True)
+        elif action == "active":
+            await _show_active(message, user, page=1)
+        elif action == "settings":
+            await _show_settings(message, user, state)
+        elif action == "help":
+            help_text = ui_txt.show_help_text()
+            await message.answer(
+                help_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=ui_kb.main_menu_kb(_is_admin(user)),
+            )
+        await _ensure_reply_menu(message, state)
         return
 
     if await _pick_target_for_private(message, state, text):
@@ -605,6 +665,7 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         except TelegramBadRequest:
             await message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        await _ensure_reply_menu(message, state)
         await query.answer()
         return
 
@@ -615,16 +676,19 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         except TelegramBadRequest:
             await message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        await _ensure_reply_menu(message, state)
         await query.answer()
         return
 
     if data == constants.CB_SETTINGS:
         await _show_settings(message, user, state)
+        await _ensure_reply_menu(message, state)
         await query.answer()
         return
 
     if data == constants.CB_CREATE:
         await _show_create_hint(message, user)
+        await _ensure_reply_menu(message, state)
         await query.answer()
         return
 
@@ -636,6 +700,7 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             except ValueError:
                 page = 1
         await _show_active(message, user, page=page, mine=True)
+        await _ensure_reply_menu(message, state)
         await query.answer()
         return
 
@@ -647,6 +712,7 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             except ValueError:
                 page = 1
         await _show_active(message, user, page=page)
+        await _ensure_reply_menu(message, state)
         await query.answer()
         return
 
