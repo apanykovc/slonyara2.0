@@ -1,0 +1,12 @@
+# Python / Telegram bot
+__pycache__/
+*.pyc
+.env
+*.db
+*.sqlite*
+logs/
+venv/
+*.log
+.idea/
+.vscode/
+.DS_Store
