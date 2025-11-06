@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from ..core.constants import (
     CB_ACTIONS,
@@ -51,6 +56,20 @@ def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="❓ Справка", callback_data=CB_HELP)],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def reply_menu_kb() -> ReplyKeyboardMarkup:
+    """Отдельная клавиатура под строкой ввода с ключевыми действиями."""
+
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="📝 Активные"),
+                KeyboardButton(text="❓ Справка"),
+            ]
+        ],
+        resize_keyboard=True,
+    )
 
 
 def settings_menu_kb(is_owner: bool = False) -> InlineKeyboardMarkup:

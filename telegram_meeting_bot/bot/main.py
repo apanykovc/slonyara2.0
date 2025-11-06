@@ -34,7 +34,15 @@ from typing import Optional, Tuple, Dict, Any, Union
 
 import pytz
 from tzlocal import get_localzone_name
-from telegram import Update, BotCommand, User, Message, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import (
+    Update,
+    BotCommand,
+    User,
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+)
 from telegram.error import RetryAfter, NetworkError, BadRequest, TimedOut
 from telegram.ext import (
     Application,
@@ -83,10 +91,18 @@ from ..core.storage import (
     add_admin_username, remove_admin_username,
 )
 from ..ui.keyboards import (
-    main_menu_kb, settings_menu_kb, tz_menu_kb, offset_menu_kb,
-    job_kb,
-    active_kb, panel_kb, choose_chat_kb, admins_menu_kb, chats_menu_kb,
     actions_kb,
+    active_kb,
+    admins_menu_kb,
+    chats_menu_kb,
+    choose_chat_kb,
+    job_kb,
+    main_menu_kb,
+    offset_menu_kb,
+    panel_kb,
+    reply_menu_kb,
+    settings_menu_kb,
+    tz_menu_kb,
 )
 from ..ui.texts import (
     menu_text_for, show_help_text, format_job_line, render_panel_text,
@@ -632,6 +648,157 @@ def auto_delete(message: Message, context: ContextTypes.DEFAULT_TYPE, delay: int
     if not message:
         return
     context.job_queue.run_once(_auto_delete, delay, data={"cid": message.chat.id, "mid": message.message_id})
+
+
+def _clear_wait_flags(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    exclude: Optional[set[str]] = None,
+) -> bool:
+    """Сбросить флаги ожидания пользовательского ввода."""
+
+    cleared = False
+    skip = exclude or set()
+    if context and getattr(context, "user_data", None) is not None:
+        if AWAIT_TZ not in skip and context.user_data.pop(AWAIT_TZ, None):
+            cleared = True
+        if AWAIT_ADMIN not in skip and context.user_data.pop(AWAIT_ADMIN, None):
+            cleared = True
+    return cleared
+
+
+async def _cancel_previous_action(
+    message: Optional[Message],
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    exclude: Optional[set[str]] = None,
+) -> bool:
+    """Отменить незавершённый ввод и уведомить пользователя."""
+
+    if not context:
+        return False
+    had = _clear_wait_flags(context, exclude=exclude)
+    if had and message is not None:
+        note = await reply_text_safe(message, "⏹️ Предыдущее действие отменено.")
+        auto_delete(note, context)
+    return had
+
+
+async def _collect_active_jobs(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    uid: int,
+    admin: bool,
+) -> list[dict]:
+    """Вернуть список задач для отображения в меню активных напоминаний."""
+
+    store = get_jobs_store()
+    if admin:
+        if chat_id > 0:
+            jobs_all = list(store)
+        else:
+            jobs_all = [j for j in store if j.get("target_chat_id") == chat_id]
+    else:
+        if chat_id > 0:
+            jobs_all = [j for j in store if j.get("author_id") == uid]
+            allowed: set[int] = set()
+            for job in jobs_all:
+                cid = job.get("target_chat_id")
+                if cid in allowed:
+                    continue
+                try:
+                    member = await context.bot.get_chat_member(cid, uid)
+                    if member.status not in ("left", "kicked"):
+                        allowed.add(cid)
+                except Exception:
+                    pass
+            jobs_all = [j for j in jobs_all if j.get("target_chat_id") in allowed]
+        else:
+            jobs_all = [
+                j
+                for j in store
+                if j.get("target_chat_id") == chat_id and j.get("author_id") == uid
+            ]
+    return sorted(jobs_all, key=lambda x: x.get("run_at_utc", ""))
+
+
+def _slice_jobs(jobs_all: list[dict], page: int) -> tuple[list[dict], int, int]:
+    pages_total = max(1, (len(jobs_all) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(max(page, 1), pages_total)
+    start = (page - 1) * PAGE_SIZE
+    chunk = jobs_all[start:start + PAGE_SIZE]
+    return chunk, page, pages_total
+
+
+async def _build_active_payload(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    uid: int,
+    admin: bool,
+    page: int,
+    *,
+    page_prefix: str = CB_ACTIVE_PAGE,
+    view: str = "all",
+) -> Optional[tuple[str, InlineKeyboardMarkup]]:
+    jobs_all = await _collect_active_jobs(context, chat_id, uid, admin)
+    if not jobs_all:
+        return None
+    chunk, page, pages_total = _slice_jobs(jobs_all, page)
+    text_out = render_active_text(chunk, len(jobs_all), page, pages_total, admin)
+    markup = active_kb(
+        chunk,
+        page,
+        pages_total,
+        uid,
+        admin,
+        page_prefix=page_prefix,
+        view=view,
+    )
+    return text_out, markup
+
+
+async def _send_active_overview_message(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user: User,
+) -> None:
+    admin = is_admin(user)
+    uid = user.id
+    payload = await _build_active_payload(context, chat_id, uid, admin, page=1)
+    if not payload:
+        note = await reply_text_safe(
+            message,
+            "Пока нет активных напоминаний.",
+            reply_markup=main_menu_kb(admin),
+        )
+        auto_delete(note, context)
+        return
+    text_out, markup = payload
+    await reply_text_safe(message, text_out, reply_markup=markup, parse_mode="HTML")
+
+
+def _make_reply_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Преобразовать aiogram-клавиатуру в формат python-telegram-bot."""
+
+    source = reply_menu_kb()
+    rows: list[list[str]] = []
+    resize = True
+    one_time = False
+
+    keyboard_rows = getattr(source, "keyboard", None)
+    if keyboard_rows:
+        for row in keyboard_rows:
+            rows.append([getattr(btn, "text", str(btn)) for btn in row])
+        resize = bool(getattr(source, "resize_keyboard", True))
+        one_time = bool(getattr(source, "one_time_keyboard", False))
+    else:
+        rows = [["📝 Активные", "❓ Справка"]]
+
+    if not rows:
+        rows = [["📝 Активные", "❓ Справка"]]
+
+    return ReplyKeyboardMarkup(rows, resize_keyboard=resize, one_time_keyboard=one_time)
 
 # ==========================
 # ----- ПАРСЕР И ОШИБКИ -----
@@ -1183,6 +1350,8 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
     admin = is_admin(user)
     data = q.data
 
+    await _cancel_previous_action(q.message, context)
+
     if data.startswith(f"{CB_PICK_CHAT}:"):
         parts = data.split(":", 3)
         if len(parts) < 4:
@@ -1257,7 +1426,10 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             auto_delete(msg, context)
             return
         context.user_data[AWAIT_ADMIN] = True
-        msg = await reply_text_safe(q.message, "Отправьте @username для добавления в админы.")
+        msg = await reply_text_safe(
+            q.message,
+            "Отправьте @username для добавления в админы. Любая другая кнопка отменит запрос.",
+        )
         auto_delete(msg, context, 60)
         return
 
@@ -1293,55 +1465,35 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
                 page = max(1, int(data.split(":")[1]))
             except Exception:
                 page = 1
-        if admin:
-            if chat_id > 0:
-                jobs_all = get_jobs_store()
-            else:
-                jobs_all = [j for j in get_jobs_store() if j.get("target_chat_id") == chat_id]
-        else:
-            if chat_id > 0:
-                jobs_all = [j for j in get_jobs_store() if j.get("author_id") == uid]
-                allowed = set()
-                for j in jobs_all:
-                    cid = j.get("target_chat_id")
-                    if cid in allowed:
-                        continue
-                    try:
-                        member = await context.bot.get_chat_member(cid, uid)
-                        if member.status not in ("left", "kicked"):
-                            allowed.add(cid)
-                    except Exception:
-                        pass
-                jobs_all = [j for j in jobs_all if j.get("target_chat_id") in allowed]
-            else:
-                jobs_all = [
-                    j
-                    for j in get_jobs_store()
-                    if j.get("target_chat_id") == chat_id and j.get("author_id") == uid
-                ]
-        jobs = sorted(jobs_all, key=lambda x: x.get("run_at_utc", ""))
-        if not jobs:
-            msg = await reply_text_safe(q.message, 
+        payload = await _build_active_payload(
+            context,
+            chat_id,
+            uid,
+            admin,
+            page,
+            page_prefix=CB_ACTIVE_PAGE,
+        )
+        if not payload:
+            msg = await reply_text_safe(
+                q.message,
                 "Пока нет активных напоминаний.",
                 reply_markup=main_menu_kb(admin),
             )
             auto_delete(msg, context)
             return
-        pages_total = max(1, (len(jobs) + PAGE_SIZE - 1) // PAGE_SIZE)
-        page = min(page, pages_total)
-        start = (page - 1) * PAGE_SIZE
-        chunk = jobs[start:start + PAGE_SIZE]
-        text_out = render_active_text(chunk, len(jobs_all), page, pages_total, admin)
+        text_out, markup = payload
         try:
-            await edit_text_safe(q.edit_message_text, 
+            await edit_text_safe(
+                q.edit_message_text,
                 text_out,
-                reply_markup=active_kb(chunk, page, pages_total, uid, admin),
+                reply_markup=markup,
                 parse_mode="HTML",
             )
         except Exception:
-            await reply_text_safe(q.message, 
+            await reply_text_safe(
+                q.message,
                 text_out,
-                reply_markup=active_kb(chunk, page, pages_total, uid, admin),
+                reply_markup=markup,
                 parse_mode="HTML",
             )
         return
@@ -1386,6 +1538,42 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         update_chat_cfg(chat_id, tz=tz_name)
         await reply_text_safe(q.message, f"✅ TZ установлена: *{tz_name}*", parse_mode="Markdown")
         await ensure_panel(update, context)
+        return
+
+    if data == CB_SET_TZ_MOSCOW:
+        if not is_admin(user):
+            msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
+            auto_delete(msg, context)
+            return
+        tz_name = "Europe/Moscow"
+        update_chat_cfg(chat_id, tz=tz_name)
+        await reply_text_safe(q.message, f"✅ TZ установлена: *{tz_name}*", parse_mode="Markdown")
+        await ensure_panel(update, context)
+        return
+
+    if data == CB_SET_TZ_CHICAGO:
+        if not is_admin(user):
+            msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
+            auto_delete(msg, context)
+            return
+        tz_name = "America/Chicago"
+        update_chat_cfg(chat_id, tz=tz_name)
+        await reply_text_safe(q.message, f"✅ TZ установлена: *{tz_name}*", parse_mode="Markdown")
+        await ensure_panel(update, context)
+        return
+
+    if data == CB_SET_TZ_ENTER:
+        if not is_admin(user):
+            msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
+            auto_delete(msg, context)
+            return
+        context.user_data[AWAIT_TZ] = True
+        note = await reply_text_safe(
+            q.message,
+            "✏️ Отправьте название таймзоны, например `Europe/Moscow`. Нажмите любую другую кнопку, чтобы отменить.",
+            parse_mode="Markdown",
+        )
+        auto_delete(note, context, 60)
         return
 
     if data == CB_SET_OFFSET:
@@ -2045,9 +2233,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _set_log_user(update)
     user = update.effective_user
     text = menu_text_for(update.effective_chat.id)
-    await reply_text_safe(update.message, 
+    await reply_text_safe(update.message,
         text, reply_markup=main_menu_kb(is_admin(user)), parse_mode="Markdown"
     )
+    if update.effective_chat.type == "private":
+        await safe_send_message(
+            context,
+            chat_id=update.effective_chat.id,
+            text="⌨️ Быстрые кнопки доступны под строкой ввода.",
+            reply_markup=_make_reply_menu_keyboard(),
+            fast_retry=False,
+        )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _set_log_user(update)
@@ -2100,6 +2296,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = chat.id
     user = update.effective_user
     uid = user.id
+
+    normalized = text_in.lower()
+    quick_actions = {
+        "активные": "active",
+        "📝 активные": "active",
+        "справка": "help",
+        "❓ справка": "help",
+    }
+    action = quick_actions.get(normalized)
+    if action == "active":
+        await _cancel_previous_action(update.message, context)
+        await _send_active_overview_message(update.message, context, chat_id, user)
+        return
+    if action == "help":
+        await _cancel_previous_action(update.message, context)
+        await cmd_help(update, context)
+        return
 
     # ожидания ввода
     if context.user_data.get(AWAIT_TZ):
