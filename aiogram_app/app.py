@@ -22,6 +22,7 @@ from apscheduler.triggers.date import DateTrigger
 from tzlocal import get_localzone_name
 
 from telegram_meeting_bot.core import constants, storage
+from telegram_meeting_bot.core.logging_setup import setup_logging
 from telegram_meeting_bot.core.parsing import parse_meeting_message
 from telegram_meeting_bot.ui import keyboards as ui_kb, texts as ui_txt
 
@@ -459,12 +460,12 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
     user = query.from_user
     message = query.message
 
-    if data != constants.CB_NOOP and not _debounce(user.id):
+    if not data.startswith(constants.CB_NOOP) and not _debounce(user.id):
         with suppress(Exception):
             await query.answer("⏳ Уже выполняю…", cache_time=1)
         return
 
-    if data == constants.CB_NOOP:
+    if data == constants.CB_NOOP or data.startswith(f"{constants.CB_NOOP}:"):
         with suppress(Exception):
             await query.answer("⏳ Уже выполняю…", cache_time=1)
         return
@@ -711,7 +712,8 @@ async def on_shutdown() -> None:
 
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    global logger
+    logger = setup_logging()
     cfg = storage.get_cfg()
     token = (cfg.get("token") if isinstance(cfg, dict) else None) or constants.BOT_TOKEN
     if not token:
