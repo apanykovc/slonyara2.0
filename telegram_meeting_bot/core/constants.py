@@ -131,6 +131,7 @@ CB_SHIFT = "shift"    # shift:<id_задачи>:минуты
 CB_SENDNOW = "send"   # send:<id_задачи> — отправить немедленно
 CB_ACTIONS = "act"     # act:<id_задачи> — меню действий
 CB_DISABLED = "noop"   # префикс замороженных кнопок: noop:<random>
+CB_NOOP = CB_DISABLED  # обратная совместимость с новым кодом
 
 # Выбор чата при создании напоминания из лички
 CB_PICK_CHAT = "pick_chat"  # pick_chat:<chat_id>:<topic_id>:<token>
