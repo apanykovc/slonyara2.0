@@ -64,11 +64,18 @@ def reply_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [
+                KeyboardButton(text="➕ Создать встречу"),
+                KeyboardButton(text="📂 Мои встречи"),
+            ],
+            [
                 KeyboardButton(text="📝 Активные"),
-                KeyboardButton(text="❓ Справка"),
-            ]
+                KeyboardButton(text="⚙️ Настройки"),
+            ],
+            [KeyboardButton(text="❓ Справка")],
         ],
         resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Выберите действие…",
     )
 
 
