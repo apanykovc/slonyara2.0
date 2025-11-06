@@ -27,7 +27,10 @@ from telegram_meeting_bot.core.parsing import parse_meeting_message
 from telegram_meeting_bot.ui import keyboards as ui_kb, texts as ui_txt
 
 
-logger = logging.getLogger("reminder-bot.aiogram")
+CB_NOOP = getattr(constants, "CB_NOOP", None) or getattr(constants, "CB_DISABLED", "noop")
+
+
+logger = setup_logging()
 
 router = Router()
 scheduler = AsyncIOScheduler(timezone=timezone.utc)
@@ -460,14 +463,19 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
     user = query.from_user
     message = query.message
 
-    if not data.startswith(constants.CB_NOOP) and not _debounce(user.id):
+    if user and not data.startswith(CB_NOOP) and not _debounce(user.id):
         with suppress(Exception):
             await query.answer("⏳ Уже выполняю…", cache_time=1)
         return
 
-    if data == constants.CB_NOOP or data.startswith(f"{constants.CB_NOOP}:"):
+    if data == CB_NOOP or data.startswith(f"{CB_NOOP}:"):
         with suppress(Exception):
             await query.answer("⏳ Уже выполняю…", cache_time=1)
+        return
+
+    if message is None:
+        with suppress(Exception):
+            await query.answer("Сообщение недоступно", show_alert=True)
         return
 
     if data == constants.CB_MENU:
@@ -712,8 +720,6 @@ async def on_shutdown() -> None:
 
 
 async def main() -> None:
-    global logger
-    logger = setup_logging()
     cfg = storage.get_cfg()
     token = (cfg.get("token") if isinstance(cfg, dict) else None) or constants.BOT_TOKEN
     if not token:
