@@ -149,6 +149,8 @@ def choose_chat_kb(chats: list, token: str) -> InlineKeyboardMarkup:
                 )
             ]
         )
+    rows.append([InlineKeyboardButton(text="📝 Активные", callback_data=CB_ACTIVE)])
+    rows.append([InlineKeyboardButton(text="❓ Справка", callback_data=CB_HELP)])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_MENU)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
