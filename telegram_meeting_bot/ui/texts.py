@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime
 from html import escape
-from datetime import datetime
-from html import escape
 from typing import Any, Dict, Iterable
 
 import pytz
@@ -66,17 +64,35 @@ def show_help_text() -> str:
     )
 
 
+def create_reminder_hint(chat_id: int) -> str:
+    tz = resolve_tz_for_chat(chat_id)
+    offset = get_offset_for_chat(chat_id)
+    tz_label = escape_md(getattr(tz, "zone", str(tz)))
+    return (
+        "🆕 *Создать встречу*\n\n"
+        "1. Отправьте сообщение формата `ДД.ММ ТИП ЧЧ:ММ ПЕРЕГ НОМЕР`.\n"
+        "2. Получите подтверждение с датой и временем напоминания.\n"
+        "3. В личных сообщениях можно выбрать чат для отправки.\n\n"
+        "_Пример:_ `08.08 МТС 20:40 2в 88634`\n\n"
+        f"Напомню за *{offset} мин* до начала. Текущая TZ: *{tz_label}*."
+    )
+
+
 def render_active_text(
     jobs: Iterable[Dict[str, Any]],
     total: int,
     page: int,
     pages_total: int,
     admin: bool,
+    *,
+    title: str = "📝 Активные",
+    empty_message: str = "Пока нет активных напоминаний.",
 ) -> str:
     """Сформировать HTML со списком задач."""
 
     jobs_list = list(jobs)
-    header = f"📝 <b>Активные</b> ({escape(str(total))}), страница <b>{escape(str(page))}/{escape(str(pages_total))}</b>:"
+    safe_title = escape(title)
+    header = f"<b>{safe_title}</b> ({escape(str(total))}), страница <b>{escape(str(page))}/{escape(str(pages_total))}</b>:"
     lines: list[str] = [header]
     known = get_known_chats()
 
@@ -130,7 +146,7 @@ def render_active_text(
 
     if len(lines) == 1:
         lines.append("")
-        lines.append("Пока нет активных напоминаний.")
+        lines.append(escape(empty_message))
     return "\n".join(lines)
 
 

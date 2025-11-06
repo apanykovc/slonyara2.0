@@ -12,8 +12,11 @@ from ..core.constants import (
     CB_CANCEL,
     CB_CHAT_DEL,
     CB_CHATS,
+    CB_CREATE,
     CB_HELP,
     CB_MENU,
+    CB_MY,
+    CB_MY_PAGE,
     CB_OFF_DEC,
     CB_OFF_INC,
     CB_OFF_PRESET_10,
@@ -39,11 +42,14 @@ from ..core.constants import (
 
 def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(text="📝 Активные", callback_data=CB_ACTIVE)]
+        [InlineKeyboardButton(text="🆕 Создать встречу", callback_data=CB_CREATE)],
+        [
+            InlineKeyboardButton(text="📂 Мои встречи", callback_data=CB_MY),
+            InlineKeyboardButton(text="📝 Активные", callback_data=CB_ACTIVE),
+        ],
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data=CB_SETTINGS)],
+        [InlineKeyboardButton(text="❓ Справка", callback_data=CB_HELP)],
     ]
-    if is_admin:
-        rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data=CB_SETTINGS)])
-    rows.append([InlineKeyboardButton(text="❓ Справка", callback_data=CB_HELP)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -153,6 +159,9 @@ def active_kb(
     pages_total: int,
     uid: int,
     is_admin: bool = False,
+    *,
+    page_prefix: str = CB_ACTIVE_PAGE,
+    view: str = "all",
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for job in chunk:
@@ -164,23 +173,28 @@ def active_kb(
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=f"⚙️ {label}", callback_data=f"{CB_ACTIONS}:{job_id}"
+                        text=f"⚙️ {label}", callback_data=f"{CB_ACTIONS}:{job_id}:{view}"
                     )
                 ]
             )
     nav: list[InlineKeyboardButton] = []
     if page > 1:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"{CB_ACTIVE_PAGE}:{page-1}"))
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"{page_prefix}:{page-1}"))
     if page < pages_total:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"{CB_ACTIVE_PAGE}:{page+1}"))
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"{page_prefix}:{page+1}"))
     if nav:
         rows.append(nav)
     else:
-        rows.append([InlineKeyboardButton(text="⟲ Обновить", callback_data=f"{CB_ACTIVE_PAGE}:{page}")])
+        rows.append([InlineKeyboardButton(text="⟲ Обновить", callback_data=f"{page_prefix}:{page}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def actions_kb(job_id: str, is_admin: bool = False) -> InlineKeyboardMarkup:
+def actions_kb(
+    job_id: str,
+    is_admin: bool = False,
+    *,
+    return_to: str | None = None,
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="📤 Отправить сейчас", callback_data=f"{CB_SENDNOW}:{job_id}")],
         [InlineKeyboardButton(text="❌ Отменить", callback_data=f"{CB_CANCEL}:{job_id}")],
@@ -192,8 +206,9 @@ def actions_kb(job_id: str, is_admin: bool = False) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="➕ +10", callback_data=f"{CB_SHIFT}:{job_id}:10"),
             ]
         )
+    suffix = f":{return_to}" if return_to else ""
     rows.append(
-        [InlineKeyboardButton(text="↩️ Назад", callback_data=f"{CB_ACTIONS}:{job_id}:close")]
+        [InlineKeyboardButton(text="↩️ Назад", callback_data=f"{CB_ACTIONS}:{job_id}:close{suffix}")]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

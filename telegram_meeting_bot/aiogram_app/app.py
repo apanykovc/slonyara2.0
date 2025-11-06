@@ -6,7 +6,7 @@ import time
 import uuid
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 import pytz
 from aiogram import Bot, Dispatcher, F, Router
@@ -80,13 +80,22 @@ def _is_owner(user: Optional[User]) -> bool:
     return username in owners or _is_admin(user)
 
 
-def _paginate_jobs(page: int, page_size: int) -> tuple[list[Dict[str, Any]], int, int]:
-    jobs = storage.get_jobs_store()
-    total = len(jobs)
-    pages_total = max(1, (total + page_size - 1) // page_size)
+def _paginate_jobs(
+    page: int,
+    page_size: int,
+    *,
+    predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+) -> tuple[list[Dict[str, Any]], int, int]:
+    jobs_all = list(storage.get_jobs_store())
+    if predicate is not None:
+        jobs_filtered = [job for job in jobs_all if predicate(job)]
+    else:
+        jobs_filtered = jobs_all
+    total = len(jobs_filtered)
+    pages_total = max(1, (total + page_size - 1) // page_size) if total else 1
     page = max(1, min(page, pages_total))
     start = (page - 1) * page_size
-    chunk = jobs[start : start + page_size]
+    chunk = jobs_filtered[start : start + page_size]
     return chunk, total, pages_total
 
 
@@ -226,21 +235,100 @@ async def schedule_reminder(
         parse_mode=ParseMode.MARKDOWN,
     )
 
-def _render_active(chunk: Iterable[Dict[str, Any]], total: int, page: int, pages_total: int, user: Optional[User]) -> tuple[str, InlineKeyboardMarkup]:
+def _render_active(
+    chunk: Iterable[Dict[str, Any]],
+    total: int,
+    page: int,
+    pages_total: int,
+    user: Optional[User],
+    *,
+    title: str,
+    page_prefix: str,
+    empty_message: str,
+    view: str,
+) -> tuple[str, InlineKeyboardMarkup]:
     admin = _is_admin(user)
-    text = ui_txt.render_active_text(list(chunk), total, page, pages_total, admin)
-    kb = ui_kb.active_kb(list(chunk), page, pages_total, uid=user.id if user else 0, is_admin=admin)
+    text = ui_txt.render_active_text(
+        list(chunk),
+        total,
+        page,
+        pages_total,
+        admin,
+        title=title,
+        empty_message=empty_message,
+    )
+    kb = ui_kb.active_kb(
+        list(chunk),
+        page,
+        pages_total,
+        uid=user.id if user else 0,
+        is_admin=admin,
+        page_prefix=page_prefix,
+        view=view,
+    )
     return text, kb
 
 
-async def _show_active(message: Message, user: Optional[User], *, page: int = 1) -> None:
-    chunk, total, pages_total = _paginate_jobs(page, constants.PAGE_SIZE or 10)
-    text, kb = _render_active(chunk, total, page, pages_total, user)
+async def _show_active(
+    message: Message,
+    user: Optional[User],
+    *,
+    page: int = 1,
+    mine: bool = False,
+) -> None:
+    predicate: Optional[Callable[[Dict[str, Any]], bool]] = None
+    title = "📝 Активные"
+    page_prefix = constants.CB_ACTIVE_PAGE
+    empty_message = "Пока нет активных напоминаний."
+    view = "all"
+    if mine:
+        if not user:
+            await message.answer("⚠️ Доступно только пользователям.")
+            return
+        uid = user.id
+        username = (user.username or "").lower()
+
+        def predicate(job: Dict[str, Any]) -> bool:
+            if job.get("author_id") == uid:
+                return True
+            if username and isinstance(job.get("author_username"), str):
+                return job["author_username"].lower() == username
+            return False
+
+        title = "📂 Мои встречи"
+        page_prefix = constants.CB_MY_PAGE
+        empty_message = "У вас пока нет запланированных встреч."
+        view = "my"
+    chunk, total, pages_total = _paginate_jobs(
+        page,
+        constants.PAGE_SIZE or 10,
+        predicate=predicate,
+    )
+    text, kb = _render_active(
+        chunk,
+        total,
+        page,
+        pages_total,
+        user,
+        title=title,
+        page_prefix=page_prefix,
+        empty_message=empty_message,
+        view=view,
+    )
     if message:
         try:
             await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         except TelegramBadRequest:
             await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def _show_create_hint(message: Message, user: Optional[User]) -> None:
+    text = ui_txt.create_reminder_hint(message.chat.id)
+    kb = ui_kb.main_menu_kb(_is_admin(user))
+    try:
+        await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    except TelegramBadRequest:
+        await message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
 
 async def _show_settings(message: Message, user: Optional[User], state: FSMContext) -> None:
@@ -286,13 +374,19 @@ def _remove_job(job_id: str) -> None:
         scheduler.remove_job(job_id)
 
 
-async def _open_actions(message: Message, user: Optional[User], job_id: str) -> None:
+async def _open_actions(
+    message: Message,
+    user: Optional[User],
+    job_id: str,
+    *,
+    context: Optional[str] = None,
+) -> None:
     job = _get_job(job_id)
     if not job:
         await message.answer("Не найдено")
         return
     label = job.get("text", "напоминание")
-    kb = ui_kb.actions_kb(job_id, is_admin=_is_admin(user))
+    kb = ui_kb.actions_kb(job_id, is_admin=_is_admin(user), return_to=context)
     text = f"⚙️ Действия для «{label}»"
     try:
         await message.edit_text(text, reply_markup=kb)
@@ -503,6 +597,22 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         await query.answer()
         return
 
+    if data == constants.CB_CREATE:
+        await _show_create_hint(message, user)
+        await query.answer()
+        return
+
+    if data == constants.CB_MY or data.startswith(f"{constants.CB_MY_PAGE}:"):
+        page = 1
+        if ":" in data:
+            try:
+                page = int(data.split(":", 1)[1])
+            except ValueError:
+                page = 1
+        await _show_active(message, user, page=page, mine=True)
+        await query.answer()
+        return
+
     if data == constants.CB_ACTIVE or data.startswith(f"{constants.CB_ACTIVE_PAGE}:"):
         page = 1
         if ":" in data:
@@ -640,11 +750,16 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         parts = data.split(":")
         job_id = parts[1] if len(parts) > 1 else None
         if len(parts) > 2 and parts[2] == "close":
-            await _show_active(message, user, page=1)
+            target = parts[3] if len(parts) > 3 else None
+            if target == "my":
+                await _show_active(message, user, page=1, mine=True)
+            else:
+                await _show_active(message, user, page=1)
             await query.answer()
             return
         if job_id:
-            await _open_actions(message, user, job_id)
+            context = parts[2] if len(parts) > 2 else None
+            await _open_actions(message, user, job_id, context=context)
             await query.answer()
             return
 
@@ -699,9 +814,6 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
 async def on_startup(bot: Bot) -> None:
     commands = [
         BotCommand(command="start", description="Приветствие"),
-        BotCommand(command="menu", description="Главное меню"),
-        BotCommand(command="help", description="Справка"),
-        BotCommand(command="register", description="Зарегистрировать чат"),
     ]
     with suppress(Exception):
         await bot.set_my_commands(commands)
