@@ -6,13 +6,14 @@ import time
 import uuid
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
 
 import pytz
+from aiohttp import ClientError
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -67,7 +68,7 @@ class ErrorsMiddleware:
             message = getattr(event, "message", None)
             if isinstance(message, Message):
                 with suppress(Exception):
-                    await message.answer("⚠️ Что-то пошло не так. Уже разбираюсь.")
+                    await _answer_safe(message, "⚠️ Что-то пошло не так. Уже разбираюсь.")
             return None
 
 
@@ -126,16 +127,119 @@ def _schedule_job(job_id: str, run_at: datetime) -> None:
     )
 
 
+_RETRYABLE_TELEGRAM_ERRORS = (
+    TelegramNetworkError,
+    ClientError,
+    asyncio.TimeoutError,
+    OSError,
+)
+
+
+async def _telegram_call(
+    action: Callable[[], Awaitable[Any]],
+    *,
+    description: str,
+    swallow_bad_request: bool = False,
+    retries: int = 3,
+    base_delay: float = 0.75,
+    bad_request_handler: Optional[Callable[[TelegramBadRequest], None]] = None,
+    raise_on_failure: bool = False,
+) -> Any:
+    """Execute Telegram API call with retries and detailed logging."""
+
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            return await action()
+        except TelegramRetryAfter as exc:
+            wait = float(getattr(exc, "retry_after", base_delay) or base_delay)
+            logger.warning(
+                "%s rate limited, sleeping for %.2fs (attempt %s/%s)",
+                description,
+                wait,
+                attempt,
+                retries,
+            )
+            await asyncio.sleep(wait)
+        except TelegramBadRequest as exc:
+            if bad_request_handler:
+                try:
+                    bad_request_handler(exc)
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.exception("%s bad request handler failed", description)
+                return None
+            if swallow_bad_request:
+                logger.warning("%s bad request: %s", description, exc)
+                return None
+            raise
+        except _RETRYABLE_TELEGRAM_ERRORS as exc:
+            if attempt >= retries:
+                logger.error(
+                    "%s failed after %s attempts: %s",
+                    description,
+                    attempt,
+                    exc,
+                )
+                if raise_on_failure:
+                    raise
+                return None
+            logger.warning(
+                "%s failed (attempt %s/%s): %s",
+                description,
+                attempt,
+                retries,
+                exc,
+            )
+            await asyncio.sleep(base_delay * attempt)
+        except Exception:
+            logger.exception("%s unexpected error", description)
+            if raise_on_failure:
+                raise
+            return None
+
+
 async def _send_safe(bot: Bot, chat_id: int | str, text: str, *, message_thread_id: Optional[int] = None) -> None:
-    try:
-        await bot.send_message(chat_id=chat_id, text=text, message_thread_id=message_thread_id)
-    except TelegramBadRequest as exc:
-        if "kicked" in str(exc).lower():
+    async def _call() -> Any:
+        return await bot.send_message(
+            chat_id=chat_id, text=text, message_thread_id=message_thread_id
+        )
+
+    def _handle_bad_request(exc: TelegramBadRequest) -> None:
+        details = str(exc).lower()
+        if "kicked" in details:
             logger.warning("Bot removed from chat %s", chat_id)
         else:
-            logger.warning("Failed to send message: %s", exc)
-    except Exception:  # pragma: no cover - network failures
-        logger.exception("send_message failed")
+            logger.warning("Failed to send message to %s: %s", chat_id, exc)
+
+    await _telegram_call(
+        _call,
+        description="bot.send_message",
+        swallow_bad_request=True,
+        bad_request_handler=_handle_bad_request,
+    )
+
+
+async def _answer_safe(message: Message, *args, **kwargs) -> Any:
+    return await _telegram_call(
+        lambda: message.answer(*args, **kwargs),
+        description="message.answer",
+        raise_on_failure=False,
+    )
+
+
+async def _edit_text_safe(message: Message, *args, **kwargs) -> Any:
+    return await _telegram_call(
+        lambda: message.edit_text(*args, **kwargs),
+        description="message.edit_text",
+        swallow_bad_request=True,
+    )
+
+
+async def _callback_answer_safe(query: CallbackQuery, *args, **kwargs) -> Any:
+    return await _telegram_call(
+        lambda: query.answer(*args, **kwargs),
+        description="callback.answer",
+        swallow_bad_request=True,
+    )
 
 
 def _apply_offset(dt: datetime, minutes: int) -> datetime:
@@ -175,7 +279,7 @@ async def _ensure_reply_menu(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     if data.get(STATE_REPLY_MENU_SHOWN):
         return
-    await message.answer("👇 Быстрые действия", reply_markup=ui_kb.reply_menu_kb())
+    await _answer_safe(message, "👇 Быстрые действия", reply_markup=ui_kb.reply_menu_kb())
     await state.update_data({STATE_REPLY_MENU_SHOWN: True})
 
 
@@ -207,9 +311,12 @@ async def _pick_target_for_private(message: Message, state: FSMContext, text: st
     candidates: list[Dict[str, Any]] = []
     for candidate in storage.get_known_chats():
         chat_id = candidate.get("chat_id")
-        try:
-            member = await message.bot.get_chat_member(chat_id, user.id)
-        except Exception:
+        member = await _telegram_call(
+            lambda: message.bot.get_chat_member(chat_id, user.id),
+            description="bot.get_chat_member",
+            swallow_bad_request=True,
+        )
+        if member is None:
             continue
         if member.status not in {"left", "kicked"}:
             candidates.append(candidate)
@@ -221,7 +328,7 @@ async def _pick_target_for_private(message: Message, state: FSMContext, text: st
     pending[token] = {"text": text}
     await state.update_data({STATE_PENDING: pending})
     candidates.append({"chat_id": message.chat.id, "title": "Личный чат"})
-    await message.answer("📨 Куда отправить напоминание?", reply_markup=ui_kb.choose_chat_kb(candidates, token))
+    await _answer_safe(message, "📨 Куда отправить напоминание?", reply_markup=ui_kb.choose_chat_kb(candidates, token))
     return True
 
 
@@ -237,14 +344,14 @@ async def schedule_reminder(
     tz = storage.resolve_tz_for_chat(int(target_chat_id) if isinstance(target_chat_id, int) else source_chat_id)
     parsed = parse_meeting_message(text, tz)
     if not parsed:
-        await message.answer(
+        await _answer_safe(message, 
             "🙈 Не понял формат. Жду: `ДД.ММ ТИП ЧЧ:ММ ПЕРЕГ НОМЕР`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     if storage.find_job_by_text(parsed["reminder_text"]):
-        await message.answer("⚠️ Такая напоминалка уже есть.")
+        await _answer_safe(message, "⚠️ Такая напоминалка уже есть.")
         return
 
     offset_minutes = storage.get_offset_for_chat(
@@ -272,12 +379,12 @@ async def schedule_reminder(
 
     if reminder_utc <= now_utc:
         await _send_safe(message.bot, target_chat_id, job_data["text"], message_thread_id=topic_id)
-        await message.answer("✅ Напоминание уже должно было прийти — отправил сразу.")
+        await _answer_safe(message, "✅ Напоминание уже должно было прийти — отправил сразу.")
         return
 
     _schedule_job(job_id, reminder_utc)
     storage.add_job_record(job_data)
-    await message.answer(
+    await _answer_safe(message, 
         f"📌 Запланировано на {reminder_local:%d.%m %H:%M}\n{parsed['canonical_full']}",
         reply_markup=ui_kb.job_kb(job_id) if _is_admin(user) else None,
         parse_mode=ParseMode.MARKDOWN,
@@ -331,7 +438,7 @@ async def _show_active(
     view = "all"
     if mine:
         if not user:
-            await message.answer("⚠️ Доступно только пользователям.")
+            await _answer_safe(message, "⚠️ Доступно только пользователям.")
             return
         uid = user.id
         username = (user.username or "").lower()
@@ -365,18 +472,18 @@ async def _show_active(
     )
     if message:
         try:
-            await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
         except TelegramBadRequest:
-            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 async def _show_create_hint(message: Message, user: Optional[User]) -> None:
     text = ui_txt.create_reminder_hint(message.chat.id)
     kb = ui_kb.main_menu_kb(_is_admin(user))
     try:
-        await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
     except TelegramBadRequest:
-        await message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
 
 async def _show_settings(message: Message, user: Optional[User], state: FSMContext) -> None:
@@ -384,9 +491,9 @@ async def _show_settings(message: Message, user: Optional[User], state: FSMConte
     kb = ui_kb.settings_menu_kb(_is_owner(user))
     text = "⚙️ Настройки"
     try:
-        await message.edit_text(text, reply_markup=kb)
+        await _edit_text_safe(message, text, reply_markup=kb)
     except TelegramBadRequest:
-        await message.answer(text, reply_markup=kb)
+        await _answer_safe(message, text, reply_markup=kb)
 
 
 async def _show_chats(message: Message) -> None:
@@ -394,9 +501,9 @@ async def _show_chats(message: Message) -> None:
     kb = ui_kb.chats_menu_kb(known)
     text = "📋 Зарегистрированные чаты"
     try:
-        await message.edit_text(text, reply_markup=kb)
+        await _edit_text_safe(message, text, reply_markup=kb)
     except TelegramBadRequest:
-        await message.answer(text, reply_markup=kb)
+        await _answer_safe(message, text, reply_markup=kb)
 
 
 async def _show_admins(message: Message) -> None:
@@ -404,9 +511,9 @@ async def _show_admins(message: Message) -> None:
     text = ui_txt.render_admins_text(admins)
     kb = ui_kb.admins_menu_kb(admins)
     try:
-        await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
     except TelegramBadRequest:
-        await message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
 def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
     try:
@@ -431,15 +538,15 @@ async def _open_actions(
 ) -> None:
     job = _get_job(job_id)
     if not job:
-        await message.answer("Не найдено")
+        await _answer_safe(message, "Не найдено")
         return
     label = job.get("text", "напоминание")
     kb = ui_kb.actions_kb(job_id, is_admin=_is_admin(user), return_to=context)
     text = f"⚙️ Действия для «{label}»"
     try:
-        await message.edit_text(text, reply_markup=kb)
+        await _edit_text_safe(message, text, reply_markup=kb)
     except TelegramBadRequest:
-        await message.answer(text, reply_markup=kb)
+        await _answer_safe(message, text, reply_markup=kb)
 
 
 def _update_job_time(job: Dict[str, Any], new_run: datetime) -> None:
@@ -499,7 +606,7 @@ def restore_jobs() -> None:
 async def cmd_start(message: Message, state: FSMContext) -> None:
     user = message.from_user
     text = ui_txt.menu_text_for(message.chat.id)
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=ui_kb.main_menu_kb(_is_admin(user)))
+    await _answer_safe(message, text, parse_mode=ParseMode.MARKDOWN, reply_markup=ui_kb.main_menu_kb(_is_admin(user)))
     await _ensure_reply_menu(message, state)
 
 
@@ -507,7 +614,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 async def cmd_help(message: Message, state: FSMContext) -> None:
     user = message.from_user
     text = ui_txt.show_help_text()
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=ui_kb.main_menu_kb(_is_admin(user)))
+    await _answer_safe(message, text, parse_mode=ParseMode.MARKDOWN, reply_markup=ui_kb.main_menu_kb(_is_admin(user)))
     await _ensure_reply_menu(message, state)
 
 
@@ -519,17 +626,17 @@ async def cmd_menu(message: Message, state: FSMContext) -> None:
 @router.message(Command("register"))
 async def cmd_register(message: Message) -> None:
     await _ensure_known_chat(message)
-    await message.answer("Чат зарегистрирован ✅")
+    await _answer_safe(message, "Чат зарегистрирован ✅")
 
 
 @router.message(Command("purge"))
 async def cmd_purge(message: Message) -> None:
     if not _is_admin(message.from_user):
-        await message.answer("Только для админов.")
+        await _answer_safe(message, "Только для админов.")
         return
     storage.set_jobs_store([])
     scheduler.remove_all_jobs()
-    await message.answer("База напоминаний очищена ✅")
+    await _answer_safe(message, "База напоминаний очищена ✅")
 
 # === Text handlers ===
 
@@ -545,30 +652,30 @@ async def handle_private_text(message: Message, state: FSMContext) -> None:
         try:
             pytz.timezone(text)
         except Exception:
-            await message.answer("Некорректная TZ. Пример: `Europe/Moscow`", parse_mode=ParseMode.MARKDOWN)
+            await _answer_safe(message, "Некорректная TZ. Пример: `Europe/Moscow`", parse_mode=ParseMode.MARKDOWN)
             return
         storage.update_chat_cfg(message.chat.id, tz=text)
         await state.update_data({STATE_AWAIT_TZ: False})
-        await message.answer(f"TZ обновлена: `{text}`", parse_mode=ParseMode.MARKDOWN)
+        await _answer_safe(message, f"TZ обновлена: `{text}`", parse_mode=ParseMode.MARKDOWN)
         return
 
     if data.get(STATE_AWAIT_ADMIN_ADD):
         await state.update_data({STATE_AWAIT_ADMIN_ADD: False})
         if not _is_owner(message.from_user):
-            await message.answer("Только владелец может управлять админами.")
+            await _answer_safe(message, "Только владелец может управлять админами.")
             return
         username = text.lstrip("@").lower()
         if not username:
-            await message.answer("Нужен логин вида @username")
+            await _answer_safe(message, "Нужен логин вида @username")
             return
         added = storage.add_admin_username(username)
-        await message.answer("✅ Добавлен" if added else "⚠️ Уже в списке")
+        await _answer_safe(message, "✅ Добавлен" if added else "⚠️ Уже в списке")
         return
 
     if data.get(STATE_AWAIT_ADMIN_DEL):
         await state.update_data({STATE_AWAIT_ADMIN_DEL: False})
         removed = storage.remove_admin_username(text.lstrip("@"))
-        await message.answer("✅ Удалён" if removed else "⚠️ Не найден")
+        await _answer_safe(message, "✅ Удалён" if removed else "⚠️ Не найден")
         return
 
     await _ensure_reply_menu(message, state)
@@ -579,7 +686,7 @@ async def handle_private_text(message: Message, state: FSMContext) -> None:
         user = message.from_user
         if action == "menu":
             menu_text = ui_txt.menu_text_for(message.chat.id)
-            await message.answer(
+            await _answer_safe(message, 
                 menu_text,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=ui_kb.main_menu_kb(_is_admin(user)),
@@ -594,7 +701,7 @@ async def handle_private_text(message: Message, state: FSMContext) -> None:
             await _show_settings(message, user, state)
         elif action == "help":
             help_text = ui_txt.show_help_text()
-            await message.answer(
+            await _answer_safe(message, 
                 help_text,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=ui_kb.main_menu_kb(_is_admin(user)),
@@ -640,17 +747,17 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
 
     if user and not data.startswith(CB_NOOP) and not _debounce(user.id):
         with suppress(Exception):
-            await query.answer("⏳ Уже выполняю…", cache_time=1)
+            await _callback_answer_safe(query, "⏳ Уже выполняю…", cache_time=1)
         return
 
     if data == CB_NOOP or data.startswith(f"{CB_NOOP}:"):
         with suppress(Exception):
-            await query.answer("⏳ Уже выполняю…", cache_time=1)
+            await _callback_answer_safe(query, "⏳ Уже выполняю…", cache_time=1)
         return
 
     if message is None:
         with suppress(Exception):
-            await query.answer("Сообщение недоступно", show_alert=True)
+            await _callback_answer_safe(query, "Сообщение недоступно", show_alert=True)
         return
 
     await _reset_interaction_state(
@@ -662,34 +769,34 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         text = ui_txt.menu_text_for(message.chat.id)
         kb = ui_kb.main_menu_kb(_is_admin(user))
         try:
-            await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         except TelegramBadRequest:
-            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         await _ensure_reply_menu(message, state)
-        await query.answer()
+        await _callback_answer_safe(query)
         return
 
     if data == constants.CB_HELP:
         text = ui_txt.show_help_text()
         kb = ui_kb.main_menu_kb(_is_admin(user))
         try:
-            await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         except TelegramBadRequest:
-            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         await _ensure_reply_menu(message, state)
-        await query.answer()
+        await _callback_answer_safe(query)
         return
 
     if data == constants.CB_SETTINGS:
         await _show_settings(message, user, state)
         await _ensure_reply_menu(message, state)
-        await query.answer()
+        await _callback_answer_safe(query)
         return
 
     if data == constants.CB_CREATE:
         await _show_create_hint(message, user)
         await _ensure_reply_menu(message, state)
-        await query.answer()
+        await _callback_answer_safe(query)
         return
 
     if data == constants.CB_MY or data.startswith(f"{constants.CB_MY_PAGE}:"):
@@ -701,7 +808,7 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
                 page = 1
         await _show_active(message, user, page=page, mine=True)
         await _ensure_reply_menu(message, state)
-        await query.answer()
+        await _callback_answer_safe(query)
         return
 
     if data == constants.CB_ACTIVE or data.startswith(f"{constants.CB_ACTIVE_PAGE}:"):
@@ -713,50 +820,50 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
                 page = 1
         await _show_active(message, user, page=page)
         await _ensure_reply_menu(message, state)
-        await query.answer()
+        await _callback_answer_safe(query)
         return
 
     if data == constants.CB_SET_TZ:
         kb = ui_kb.tz_menu_kb()
         try:
-            await message.edit_text("Выберите таймзону", reply_markup=kb)
+            await _edit_text_safe(message, "Выберите таймзону", reply_markup=kb)
         except TelegramBadRequest:
-            await message.answer("Выберите таймзону", reply_markup=kb)
-        await query.answer()
+            await _answer_safe(message, "Выберите таймзону", reply_markup=kb)
+        await _callback_answer_safe(query)
         return
 
     if data == constants.CB_SET_TZ_LOCAL:
         tz_name = get_localzone_name()
         storage.update_chat_cfg(message.chat.id, tz=tz_name)
-        await message.answer(f"TZ обновлена: {tz_name}")
-        await query.answer()
+        await _answer_safe(message, f"TZ обновлена: {tz_name}")
+        await _callback_answer_safe(query)
         return
 
     if data == constants.CB_SET_TZ_MOSCOW:
         storage.update_chat_cfg(message.chat.id, tz="Europe/Moscow")
-        await message.answer("TZ обновлена: Europe/Moscow")
-        await query.answer()
+        await _answer_safe(message, "TZ обновлена: Europe/Moscow")
+        await _callback_answer_safe(query)
         return
 
     if data == constants.CB_SET_TZ_CHICAGO:
         storage.update_chat_cfg(message.chat.id, tz="America/Chicago")
-        await message.answer("TZ обновлена: America/Chicago")
-        await query.answer()
+        await _answer_safe(message, "TZ обновлена: America/Chicago")
+        await _callback_answer_safe(query)
         return
 
     if data == constants.CB_SET_TZ_ENTER:
         await state.update_data({STATE_AWAIT_TZ: True})
-        await message.answer("Введи название таймзоны, например `Europe/Moscow`", parse_mode=ParseMode.MARKDOWN)
-        await query.answer()
+        await _answer_safe(message, "Введи название таймзоны, например `Europe/Moscow`", parse_mode=ParseMode.MARKDOWN)
+        await _callback_answer_safe(query)
         return
 
     if data == constants.CB_SET_OFFSET:
         kb = ui_kb.offset_menu_kb()
         try:
-            await message.edit_text("⏳ Выберите оффсет", reply_markup=kb)
+            await _edit_text_safe(message, "⏳ Выберите оффсет", reply_markup=kb)
         except TelegramBadRequest:
-            await message.answer("⏳ Выберите оффсет", reply_markup=kb)
-        await query.answer()
+            await _answer_safe(message, "⏳ Выберите оффсет", reply_markup=kb)
+        await _callback_answer_safe(query)
         return
 
     if data in {constants.CB_OFF_DEC, constants.CB_OFF_INC} or data.startswith("off_p"):
@@ -772,13 +879,13 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             except Exception:
                 current = 30
         storage.update_chat_cfg(message.chat.id, offset=current)
-        await message.answer(f"⏳ Оффсет: {current} мин")
-        await query.answer()
+        await _answer_safe(message, f"⏳ Оффсет: {current} мин")
+        await _callback_answer_safe(query)
         return
 
     if data == constants.CB_CHATS:
         await _show_chats(message)
-        await query.answer()
+        await _callback_answer_safe(query)
         return
 
     if data.startswith(f"{constants.CB_CHAT_DEL}:"):
@@ -788,31 +895,31 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         if chat_id is not None:
             storage.unregister_chat(chat_id, topic_id if topic_id else None)
             await _show_chats(message)
-        await query.answer("Удалено")
+        await _callback_answer_safe(query, "Удалено")
         return
 
     if data == constants.CB_ADMINS:
         await _show_admins(message)
-        await query.answer()
+        await _callback_answer_safe(query)
         return
 
     if data == constants.CB_ADMIN_ADD:
         await state.update_data({STATE_AWAIT_ADMIN_ADD: True})
-        await message.answer("Введи @username для добавления")
-        await query.answer()
+        await _answer_safe(message, "Введи @username для добавления")
+        await _callback_answer_safe(query)
         return
 
     if data.startswith(f"{constants.CB_ADMIN_DEL}:"):
         username = data.split(":", 1)[1]
         removed = storage.remove_admin_username(username)
-        await message.answer("✅ Удалён" if removed else "⚠️ Не найден")
-        await query.answer()
+        await _answer_safe(message, "✅ Удалён" if removed else "⚠️ Не найден")
+        await _callback_answer_safe(query)
         return
 
     if data.startswith(f"{constants.CB_PICK_CHAT}:"):
         parts = data.split(":")
         if len(parts) < 4:
-            await query.answer("Некорректные данные", show_alert=True)
+            await _callback_answer_safe(query, "Некорректные данные", show_alert=True)
             return
         chat_id_raw, topic_raw, token = parts[1], parts[2], parts[3]
         try:
@@ -825,7 +932,7 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         entry = pending.pop(token, None)
         await state.update_data({STATE_PENDING: pending})
         if not entry:
-            await query.answer("Истекло", show_alert=True)
+            await _callback_answer_safe(query, "Истекло", show_alert=True)
             return
         await schedule_reminder(
             message=message,
@@ -835,7 +942,7 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             text=entry.get("text", ""),
             topic_id=topic_id,
         )
-        await query.answer("Готово")
+        await _callback_answer_safe(query, "Готово")
         return
 
     if data.startswith(f"{constants.CB_ACTIONS}:"):
@@ -847,31 +954,31 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
                 await _show_active(message, user, page=1, mine=True)
             else:
                 await _show_active(message, user, page=1)
-            await query.answer()
+            await _callback_answer_safe(query)
             return
         if job_id:
             context = parts[2] if len(parts) > 2 else None
             await _open_actions(message, user, job_id, context=context)
-            await query.answer()
+            await _callback_answer_safe(query)
             return
 
     if data.startswith(f"{constants.CB_SENDNOW}:"):
         job_id = data.split(":", 1)[1]
         await send_reminder_job(job_id=job_id)
-        await query.answer("Отправлено")
+        await _callback_answer_safe(query, "Отправлено")
         return
 
     if data.startswith(f"{constants.CB_CANCEL}:"):
         job_id = data.split(":", 1)[1]
         _remove_job(job_id)
         await _show_active(message, user, page=1)
-        await query.answer("Удалено")
+        await _callback_answer_safe(query, "Удалено")
         return
 
     if data.startswith(f"{constants.CB_SHIFT}:"):
         parts = data.split(":")
         if len(parts) < 3:
-            await query.answer("Некорректные данные", show_alert=True)
+            await _callback_answer_safe(query, "Некорректные данные", show_alert=True)
             return
         job_id = parts[1]
         try:
@@ -880,7 +987,7 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             minutes = 5
         job = _get_job(job_id)
         if not job:
-            await query.answer("Не найдено", show_alert=True)
+            await _callback_answer_safe(query, "Не найдено", show_alert=True)
             return
         run_iso = job.get("run_at_utc")
         try:
@@ -891,14 +998,14 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             run_at = _utc_now()
         new_run = run_at + timedelta(minutes=minutes)
         _update_job_time(job, new_run)
-        await query.answer(f"Сдвинуто на +{minutes} мин")
+        await _callback_answer_safe(query, f"Сдвинуто на +{minutes} мин")
         return
 
     if data.startswith(f"{constants.CB_RRULE}:"):
-        await query.answer("Повторы пока недоступны", show_alert=True)
+        await _callback_answer_safe(query, "Повторы пока недоступны", show_alert=True)
         return
 
-    await query.answer("Неизвестная кнопка", show_alert=True)
+    await _callback_answer_safe(query, "Неизвестная кнопка", show_alert=True)
 
 # === Lifecycle ===
 
