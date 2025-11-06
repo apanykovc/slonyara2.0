@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from ..core.constants import (
     CB_ACTIONS,
@@ -51,6 +56,15 @@ def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="❓ Справка", callback_data=CB_HELP)],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def quick_reply_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Активные"), KeyboardButton(text="Справка")]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Отправьте встречу или выберите действие",
+    )
 
 
 def settings_menu_kb(is_owner: bool = False) -> InlineKeyboardMarkup:
@@ -149,6 +163,8 @@ def choose_chat_kb(chats: list, token: str) -> InlineKeyboardMarkup:
                 )
             ]
         )
+    rows.append([InlineKeyboardButton(text="📝 Активные", callback_data=CB_ACTIVE)])
+    rows.append([InlineKeyboardButton(text="❓ Справка", callback_data=CB_HELP)])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_MENU)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

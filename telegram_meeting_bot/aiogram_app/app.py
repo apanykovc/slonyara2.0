@@ -39,6 +39,7 @@ STATE_AWAIT_TZ = "await_tz"
 STATE_AWAIT_ADMIN_ADD = "await_admin"
 STATE_AWAIT_ADMIN_DEL = "await_admin_del"
 STATE_PENDING = "pending_reminders"
+STATE_HAS_REPLY_KB = "has_quick_kb"
 
 
 class ErrorsMiddleware:
@@ -150,6 +151,40 @@ async def _ensure_known_chat(message: Message) -> None:
     if chat.type in {"group", "supergroup"}:
         title = chat.title or (chat.username and f"@{chat.username}") or str(chat.id)
         storage.register_chat(chat.id, title, topic_id=message.message_thread_id)
+
+
+async def _reset_interaction_state(
+    state: FSMContext, *, preserve_pending: bool = False
+) -> None:
+    """Сбрасывает все флаги ожиданий и отложенные операции."""
+
+    data = await state.get_data()
+    updates: Dict[str, Any] = {}
+
+    if data.get(STATE_AWAIT_TZ):
+        updates[STATE_AWAIT_TZ] = False
+    if data.get(STATE_AWAIT_ADMIN_ADD):
+        updates[STATE_AWAIT_ADMIN_ADD] = False
+    if data.get(STATE_AWAIT_ADMIN_DEL):
+        updates[STATE_AWAIT_ADMIN_DEL] = False
+    if not preserve_pending and data.get(STATE_PENDING):
+        updates[STATE_PENDING] = {}
+
+    if updates:
+        await state.update_data(updates)
+
+
+async def _ensure_quick_reply_keyboard(message: Message, state: FSMContext) -> None:
+    if message.chat.type != "private":
+        return
+    data = await state.get_data()
+    if data.get(STATE_HAS_REPLY_KB):
+        return
+    await state.update_data({STATE_HAS_REPLY_KB: True})
+    await message.answer(
+        "👇 Быстрые кнопки доступны под полем ввода.",
+        reply_markup=ui_kb.quick_reply_kb(),
+    )
 
 
 async def _pick_target_for_private(message: Message, state: FSMContext, text: str) -> bool:
@@ -448,22 +483,26 @@ def restore_jobs() -> None:
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await _reset_interaction_state(state)
     user = message.from_user
     text = ui_txt.menu_text_for(message.chat.id)
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=ui_kb.main_menu_kb(_is_admin(user)))
+    await _ensure_quick_reply_keyboard(message, state)
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
+async def cmd_help(message: Message, state: FSMContext) -> None:
+    await _reset_interaction_state(state)
     user = message.from_user
     text = ui_txt.show_help_text()
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=ui_kb.main_menu_kb(_is_admin(user)))
+    await _ensure_quick_reply_keyboard(message, state)
 
 
 @router.message(Command("menu"))
-async def cmd_menu(message: Message) -> None:
-    await cmd_start(message)
+async def cmd_menu(message: Message, state: FSMContext) -> None:
+    await cmd_start(message, state)
 
 
 @router.message(Command("register"))
@@ -490,6 +529,25 @@ async def handle_private_text(message: Message, state: FSMContext) -> None:
     if not text or text.startswith("/"):
         return
 
+    normalized = text.lower()
+    if normalized == "активные":
+        await _reset_interaction_state(state)
+        placeholder = await message.answer("📝 Собираю список активных…")
+        await _show_active(placeholder, message.from_user, page=1)
+        await _ensure_quick_reply_keyboard(message, state)
+        return
+
+    if normalized == "справка":
+        await _reset_interaction_state(state)
+        help_text = ui_txt.show_help_text()
+        await message.answer(
+            help_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ui_kb.main_menu_kb(_is_admin(message.from_user)),
+        )
+        await _ensure_quick_reply_keyboard(message, state)
+        return
+
     data = await state.get_data()
     if data.get(STATE_AWAIT_TZ):
         try:
@@ -500,6 +558,7 @@ async def handle_private_text(message: Message, state: FSMContext) -> None:
         storage.update_chat_cfg(message.chat.id, tz=text)
         await state.update_data({STATE_AWAIT_TZ: False})
         await message.answer(f"TZ обновлена: `{text}`", parse_mode=ParseMode.MARKDOWN)
+        await _ensure_quick_reply_keyboard(message, state)
         return
 
     if data.get(STATE_AWAIT_ADMIN_ADD):
@@ -513,15 +572,18 @@ async def handle_private_text(message: Message, state: FSMContext) -> None:
             return
         added = storage.add_admin_username(username)
         await message.answer("✅ Добавлен" if added else "⚠️ Уже в списке")
+        await _ensure_quick_reply_keyboard(message, state)
         return
 
     if data.get(STATE_AWAIT_ADMIN_DEL):
         await state.update_data({STATE_AWAIT_ADMIN_DEL: False})
         removed = storage.remove_admin_username(text.lstrip("@"))
         await message.answer("✅ Удалён" if removed else "⚠️ Не найден")
+        await _ensure_quick_reply_keyboard(message, state)
         return
 
     if await _pick_target_for_private(message, state, text):
+        await _ensure_quick_reply_keyboard(message, state)
         return
 
     await schedule_reminder(
@@ -532,6 +594,7 @@ async def handle_private_text(message: Message, state: FSMContext) -> None:
         text=text,
         topic_id=message.message_thread_id,
     )
+    await _ensure_quick_reply_keyboard(message, state)
 
 
 @router.message(F.chat.type.in_({"group", "supergroup"}), F.text)
@@ -571,6 +634,14 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         with suppress(Exception):
             await query.answer("Сообщение недоступно", show_alert=True)
         return
+
+    if message.chat.type == "private":
+        await _ensure_quick_reply_keyboard(message, state)
+
+    await _reset_interaction_state(
+        state,
+        preserve_pending=data.startswith(f"{constants.CB_PICK_CHAT}:")
+    )
 
     if data == constants.CB_MENU:
         text = ui_txt.menu_text_for(message.chat.id)
