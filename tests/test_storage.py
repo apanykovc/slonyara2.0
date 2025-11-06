@@ -24,7 +24,7 @@ if "tzlocal" not in sys.modules:
 
 import pytest
 
-from core import storage
+from telegram_meeting_bot.core import storage
 
 
 @pytest.fixture(autouse=True)
