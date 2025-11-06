@@ -152,6 +152,27 @@ async def _ensure_known_chat(message: Message) -> None:
         storage.register_chat(chat.id, title, topic_id=message.message_thread_id)
 
 
+async def _reset_interaction_state(
+    state: FSMContext, *, preserve_pending: bool = False
+) -> None:
+    """Сбрасывает все флаги ожиданий и отложенные операции."""
+
+    data = await state.get_data()
+    updates: Dict[str, Any] = {}
+
+    if data.get(STATE_AWAIT_TZ):
+        updates[STATE_AWAIT_TZ] = False
+    if data.get(STATE_AWAIT_ADMIN_ADD):
+        updates[STATE_AWAIT_ADMIN_ADD] = False
+    if data.get(STATE_AWAIT_ADMIN_DEL):
+        updates[STATE_AWAIT_ADMIN_DEL] = False
+    if not preserve_pending and data.get(STATE_PENDING):
+        updates[STATE_PENDING] = {}
+
+    if updates:
+        await state.update_data(updates)
+
+
 async def _pick_target_for_private(message: Message, state: FSMContext, text: str) -> bool:
     user = message.from_user
     if user is None:
@@ -571,6 +592,11 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         with suppress(Exception):
             await query.answer("Сообщение недоступно", show_alert=True)
         return
+
+    await _reset_interaction_state(
+        state,
+        preserve_pending=data.startswith(f"{constants.CB_PICK_CHAT}:")
+    )
 
     if data == constants.CB_MENU:
         text = ui_txt.menu_text_for(message.chat.id)
