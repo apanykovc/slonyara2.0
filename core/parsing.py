@@ -1,48 +1,79 @@
 from __future__ import annotations
-from typing import Optional, Dict, Any
-from datetime import datetime
-import logging
 
-from .constants import MEETING_REGEX
+import logging
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+from .constants import MEETING_REGEX, REMINDER_TEMPLATE
 
 logger = logging.getLogger("reminder-bot.aiogram")
 
+
+def _localize(tz, dt: datetime) -> datetime:
+    """Attach timezone info to ``dt`` supporting both pytz and zoneinfo."""
+
+    if hasattr(tz, "localize"):
+        return tz.localize(dt)  # type: ignore[no-any-return]
+    return dt.replace(tzinfo=tz)
+
+
 def parse_meeting_message(text: str, tz) -> Optional[Dict[str, Any]]:
-    """Парсит строку вида '08.08 МТС 20:40 2в 88634'.
-    Возвращает dict с ключами: date (aware datetime), typ, room, req
+    """Разобрать строку вида ``ДД.ММ ТИП ЧЧ:ММ ПЕРЕГ НОМЕР``.
+
+    Возвращает словарь с ключами:
+    ``dt_local`` (aware ``datetime``), ``date_str``, ``time_str``, ``type``,
+    ``room``, ``ticket``, ``canonical_full`` и ``reminder_text``.
     """
-    m = MEETING_REGEX.match(text or "")
-    if not m:
+
+    match = MEETING_REGEX.match(text or "")
+    if not match:
         return None
+
+    day_str, month_str, meeting_type, time_part, room, ticket = match.groups()
     try:
-        d = int(m['d'])
-        mth = int(m['mth'])
-        typ = m['typ'].strip()
-        hh = int(m['hh'])
-        mm = int(m['mm'])
-        room = m['room'].strip()
-        req = m['req'].strip()
-
-        now = datetime.now(tz)
-        year = now.year
-
-        candidate = datetime(year, mth, d, hh, mm)
-        # pytz vs zoneinfo
-        if hasattr(tz, "localize"):
-            candidate = tz.localize(candidate)        # pytz
-        else:
-            candidate = candidate.replace(tzinfo=tz)  # zoneinfo
-
-        if candidate < now:
-            # если дата уже прошла — пробуем следующий год
-            candidate = candidate.replace(year=year + 1)
-
-        return {
-            "date": candidate,
-            "typ": typ,
-            "room": room,
-            "req": req,
-        }
-    except Exception as e:
-        logger.exception("Ошибка парсинга строки встречи: %s", e)
+        day = int(day_str)
+        month = int(month_str)
+        hour_str, minute_str = time_part.split(":", 1)
+        hour = int(hour_str)
+        minute = int(minute_str)
+    except (TypeError, ValueError):
+        logger.debug("parse_meeting_message: failed to convert numbers", exc_info=True)
         return None
+
+    now = datetime.now(tz)
+    year = now.year
+
+    try:
+        candidate = _localize(tz, datetime(year, month, day, hour, minute))
+    except Exception:
+        logger.debug("parse_meeting_message: invalid date", exc_info=True)
+        return None
+
+    # если выбранное время уже прошло в текущем году — переносим на следующий
+    if candidate <= now:
+        try:
+            candidate = _localize(tz, datetime(year + 1, month, day, hour, minute))
+        except Exception:
+            logger.debug("parse_meeting_message: invalid rollover date", exc_info=True)
+            return None
+
+    date_str = f"{day:02d}.{month:02d}"
+    time_str = f"{hour:02d}:{minute:02d}"
+    canonical = f"{date_str} {meeting_type} {time_str} {room} {ticket}"
+
+    return {
+        "dt_local": candidate,
+        "date_str": date_str,
+        "time_str": time_str,
+        "type": meeting_type,
+        "room": room,
+        "ticket": ticket,
+        "canonical_full": canonical,
+        "reminder_text": REMINDER_TEMPLATE.format(
+            date=date_str,
+            type=meeting_type,
+            time=time_str,
+            room=room,
+            ticket=ticket,
+        ),
+    }
