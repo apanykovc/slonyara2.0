@@ -244,8 +244,22 @@ def register_chat(
     chats = get_known_chats()
     cid = str(chat_id)
     tid = topic_id or 0
-    for c in chats:
+    for idx, c in enumerate(chats):
         if str(c.get("chat_id")) == cid and int(c.get("topic_id", 0)) == tid:
+            updated = False
+            new_entry = dict(c)
+            if title and title != c.get("title"):
+                new_entry["title"] = title
+                updated = True
+            if topic_id is not None and topic_id != c.get("topic_id"):
+                new_entry["topic_id"] = topic_id
+                updated = True
+            if topic_title and topic_title != c.get("topic_title"):
+                new_entry["topic_title"] = topic_title
+                updated = True
+            if updated:
+                chats[idx] = new_entry
+                save_json(TARGETS_PATH, chats)
             return False
 
     entry = {"chat_id": chat_id, "title": title}
