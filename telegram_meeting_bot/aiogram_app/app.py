@@ -144,6 +144,7 @@ async def _telegram_call(
     base_delay: float = 0.75,
     bad_request_handler: Optional[Callable[[TelegramBadRequest], None]] = None,
     raise_on_failure: bool = False,
+    on_give_up: Optional[Callable[[Exception], Awaitable[None]]] = None,
 ) -> Any:
     """Execute Telegram API call with retries and detailed logging."""
 
@@ -179,6 +180,9 @@ async def _telegram_call(
                     attempt,
                     exc,
                 )
+                if on_give_up is not None:
+                    with suppress(Exception):
+                        await on_give_up(exc)
                 if raise_on_failure:
                     raise
                 return None
@@ -210,36 +214,128 @@ async def _send_safe(bot: Bot, chat_id: int | str, text: str, *, message_thread_
         else:
             logger.warning("Failed to send message to %s: %s", chat_id, exc)
 
+    async def _on_failure(exc: Exception) -> None:
+        logger.warning(
+            "bot.send_message to %s failed permanently: %s",
+            chat_id,
+            exc,
+        )
+
     await _telegram_call(
         _call,
         description="bot.send_message",
         swallow_bad_request=True,
         bad_request_handler=_handle_bad_request,
+        on_give_up=_on_failure,
     )
 
 
 async def _answer_safe(message: Message, *args, **kwargs) -> Any:
+    async def _on_failure(exc: Exception) -> None:
+        logger.warning(
+            "message.answer failed for chat %s message %s: %s",
+            getattr(message.chat, "id", None),
+            message.message_id,
+            exc,
+        )
+
     return await _telegram_call(
         lambda: message.answer(*args, **kwargs),
         description="message.answer",
         raise_on_failure=False,
+        on_give_up=_on_failure,
     )
 
 
 async def _edit_text_safe(message: Message, *args, **kwargs) -> Any:
-    return await _telegram_call(
-        lambda: message.edit_text(*args, **kwargs),
-        description="message.edit_text",
-        swallow_bad_request=True,
-    )
+    parse_mode = kwargs.get("parse_mode")
+    reply_markup = kwargs.get("reply_markup")
+
+    if args:
+        text = args[0]
+    else:
+        text = kwargs.get("text")
+
+    def _current_text() -> Optional[str]:
+        if parse_mode == ParseMode.HTML:
+            return message.html_text
+        if parse_mode == ParseMode.MARKDOWN:
+            return message.text
+        return message.text
+
+    def _dump_markup(kb: Optional[InlineKeyboardMarkup]) -> Optional[tuple]:
+        if kb is None:
+            return None
+        try:
+            return tuple(tuple(repr(btn) for btn in row) for row in kb.inline_keyboard)
+        except Exception:
+            return None
+
+    if text is not None:
+        current = _current_text()
+        if current == text:
+            current_markup = _dump_markup(message.reply_markup)
+            new_markup = _dump_markup(reply_markup)
+            if current_markup == new_markup:
+                logger.debug(
+                    "Skip editing message %s in chat %s: content unchanged",
+                    message.message_id,
+                    getattr(message.chat, "id", None),
+                )
+                return message
+
+    async def _on_failure(exc: Exception) -> None:
+        logger.warning(
+            "message.edit_text failed for chat %s message %s: %s",
+            getattr(message.chat, "id", None),
+            message.message_id,
+            exc,
+        )
+
+    try:
+        return await _telegram_call(
+            lambda: message.edit_text(*args, **kwargs),
+            description="message.edit_text",
+            swallow_bad_request=False,
+            on_give_up=_on_failure,
+        )
+    except TelegramBadRequest as exc:
+        details = str(exc).lower()
+        if "message is not modified" in details:
+            logger.debug(
+                "Skip editing message %s: Telegram says not modified",
+                message.message_id,
+            )
+            return message
+        raise
 
 
 async def _callback_answer_safe(query: CallbackQuery, *args, **kwargs) -> Any:
+    async def _on_failure(exc: Exception) -> None:
+        logger.warning(
+            "callback.answer failed for chat %s query %s: %s",
+            getattr(getattr(query.message, "chat", None), "id", None),
+            query.id,
+            exc,
+        )
+
     return await _telegram_call(
         lambda: query.answer(*args, **kwargs),
         description="callback.answer",
         swallow_bad_request=True,
+        on_give_up=_on_failure,
     )
+
+
+def _ack_callback_background(query: CallbackQuery, *args, **kwargs) -> asyncio.Task[Any]:
+    async def _run() -> None:
+        try:
+            await _callback_answer_safe(query, *args, **kwargs)
+        except Exception:
+            logger.debug("Background callback answer failed", exc_info=True)
+
+    task = asyncio.create_task(_run())
+    return task
 
 
 def _apply_offset(dt: datetime, minutes: int) -> datetime:
@@ -773,6 +869,8 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         with suppress(Exception):
             await _callback_answer_safe(query, "Сообщение недоступно", show_alert=True)
         return
+
+    _ack_callback_background(query, "В работе", cache_time=1)
 
     await _reset_interaction_state(
         state,
