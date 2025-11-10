@@ -23,6 +23,7 @@ from apscheduler.triggers.date import DateTrigger
 from tzlocal import get_localzone_name
 
 from telegram_meeting_bot.core import constants, storage
+from telegram_meeting_bot.core.audit import audit_log
 from telegram_meeting_bot.core.logging_setup import setup_logging
 from telegram_meeting_bot.core.parsing import parse_meeting_message
 from telegram_meeting_bot.ui import keyboards as ui_kb, texts as ui_txt
@@ -482,12 +483,30 @@ async def schedule_reminder(
     }
 
     if reminder_utc <= now_utc:
+        audit_log(
+            "REM_SEND_NOW",
+            chat_id=target_chat_id,
+            topic_id=topic_id,
+            title=parsed["reminder_text"],
+            user_id=getattr(user, "id", None),
+        )
         await _send_safe(message.bot, target_chat_id, job_data["text"], message_thread_id=topic_id)
         await _answer_safe(message, "✅ Напоминание уже должно было прийти — отправил сразу.")
         return
 
     _schedule_job(job_id, reminder_utc)
     storage.add_job_record(job_data)
+    audit_log(
+        "REM_SCHEDULED",
+        reminder_id=job_id,
+        chat_id=target_chat_id,
+        topic_id=topic_id,
+        user_id=getattr(user, "id", None),
+        title=job_data["text"],
+        when=reminder_utc,
+        tz=getattr(tz, "zone", str(tz)),
+        delay_sec=round((reminder_utc - now_utc).total_seconds(), 1),
+    )
     await _answer_safe(message, 
         f"📌 Запланировано на {reminder_local:%d.%m %H:%M}\n{parsed['canonical_full']}",
         reply_markup=ui_kb.job_kb(job_id) if _is_admin(user) else None,
@@ -671,6 +690,14 @@ async def send_reminder_job(job_id: str | None = None, **_: Any) -> None:
     job = _get_job(job_id)
     if not job:
         return
+    audit_log(
+        "REM_FIRED",
+        reminder_id=job_id,
+        chat_id=job.get("target_chat_id"),
+        topic_id=job.get("topic_id"),
+        title=job.get("text"),
+        user_id=job.get("author_id"),
+    )
     await _send_safe(bot, job.get("target_chat_id"), job.get("text", ""), message_thread_id=job.get("topic_id"))
     rrule = job.get("rrule", constants.RR_ONCE)
     run_iso = job.get("run_at_utc")
@@ -683,9 +710,29 @@ async def send_reminder_job(job_id: str | None = None, **_: Any) -> None:
     if rrule == constants.RR_DAILY:
         next_run = run_at + timedelta(days=1)
         _update_job_time(job, next_run)
+        audit_log(
+            "REM_RESCHEDULED",
+            reminder_id=job_id,
+            chat_id=job.get("target_chat_id"),
+            topic_id=job.get("topic_id"),
+            title=job.get("text"),
+            user_id=job.get("author_id"),
+            repeat_next_at=next_run,
+            reason="repeat",
+        )
     elif rrule == constants.RR_WEEKLY:
         next_run = run_at + timedelta(weeks=1)
         _update_job_time(job, next_run)
+        audit_log(
+            "REM_RESCHEDULED",
+            reminder_id=job_id,
+            chat_id=job.get("target_chat_id"),
+            topic_id=job.get("topic_id"),
+            title=job.get("text"),
+            user_id=job.get("author_id"),
+            repeat_next_at=next_run,
+            reason="repeat",
+        )
     else:
         _remove_job(job_id)
 
@@ -1130,7 +1177,18 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
 
     if data.startswith(f"{constants.CB_CANCEL}:"):
         job_id = data.split(":", 1)[1]
+        job = _get_job(job_id)
         _remove_job(job_id)
+        if job:
+            audit_log(
+                "REM_CANCELED",
+                reminder_id=job_id,
+                chat_id=job.get("target_chat_id"),
+                topic_id=job.get("topic_id"),
+                user_id=getattr(user, "id", None),
+                title=job.get("text"),
+                reason="manual",
+            )
         await _show_active(message, user, page=1)
         await _callback_answer_safe(query, "Удалено")
         return
@@ -1158,6 +1216,16 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             run_at = _utc_now()
         new_run = run_at + timedelta(minutes=minutes)
         _update_job_time(job, new_run)
+        audit_log(
+            "REM_RESCHEDULED",
+            reminder_id=job_id,
+            chat_id=job.get("target_chat_id"),
+            topic_id=job.get("topic_id"),
+            title=job.get("text"),
+            user_id=getattr(user, "id", None),
+            when=new_run,
+            reason="manual_shift",
+        )
         await _callback_answer_safe(query, f"Сдвинуто на +{minutes} мин")
         return
 
