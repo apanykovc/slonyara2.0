@@ -106,7 +106,7 @@ from ..ui.keyboards import (
 )
 from ..ui.texts import (
     menu_text_for, show_help_text, format_job_line, render_panel_text,
-    render_admins_text, render_active_text, escape_md,
+    render_admins_text, render_active_text, escape_md, create_reminder_hint,
 )
 # ==========================
 # ----- КОНФИГ И ЛОГИ -----
@@ -1389,6 +1389,8 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             cfg_chat_id = sel
         topic_id = None if topic == "0" else int(topic)
         await schedule_reminder_core(pend["text"], cfg_chat_id, update, context, user, topic_override=topic_id)
+        context.user_data["last_target"] = {"chat_id": cfg_chat_id, "topic_id": topic_id}
+        context.user_data["force_pick"] = False
         try:
             await q.message.delete()
         except Exception:
@@ -2311,6 +2313,50 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     note = "✅ Чат добавлен в список." if added else "ℹ️ Этот чат уже зарегистрирован."
     await reply_text_safe(update.message, note)
 
+
+async def _get_valid_last_target(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> Optional[Dict[str, Any]]:
+    entry = context.user_data.get("last_target") if context and getattr(context, "user_data", None) else None
+    if not isinstance(entry, dict):
+        return None
+    chat_id = entry.get("chat_id")
+    topic_id = entry.get("topic_id")
+    if chat_id is None:
+        return None
+    message = update.effective_message
+    if message and chat_id == message.chat.id and int(topic_id or 0) == int(getattr(message, "message_thread_id", 0) or 0):
+        return {"chat_id": chat_id, "topic_id": topic_id}
+
+    match = next(
+        (
+            candidate
+            for candidate in get_known_chats()
+            if str(candidate.get("chat_id")) == str(chat_id)
+            and int(candidate.get("topic_id") or 0) == int(topic_id or 0)
+        ),
+        None,
+    )
+    if not match:
+        context.user_data.pop("last_target", None)
+        return None
+
+    user = update.effective_user
+    if isinstance(chat_id, int) and user:
+        try:
+            member = await context.bot.get_chat_member(chat_id, user.id)
+        except Exception:
+            context.user_data.pop("last_target", None)
+            return None
+        if member and member.status not in ("left", "kicked"):
+            return {"chat_id": chat_id, "topic_id": topic_id}
+        context.user_data.pop("last_target", None)
+        return None
+
+    return {"chat_id": chat_id, "topic_id": topic_id}
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _set_log_user(update)
     if not update.message or not update.message.text:
@@ -2327,6 +2373,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📝 активные": "active",
         "справка": "help",
         "❓ справка": "help",
+        "➕ создать встречу": "create",
+        "+ создать встречу": "create",
+        "🆕 создать встречу": "create",
+        "создать встречу": "create",
     }
     action = quick_actions.get(normalized)
     if action == "active":
@@ -2340,6 +2390,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "help":
         await _cancel_previous_action(update.message, context)
         await cmd_help(update, context)
+        return
+    if action == "create":
+        await _cancel_previous_action(update.message, context)
+        context.user_data["force_pick"] = True
+        hint = create_reminder_hint(chat_id)
+        await reply_text_safe(
+            update.message,
+            hint,
+            reply_markup=main_menu_kb(is_admin(user)),
+            parse_mode="Markdown",
+        )
         return
 
     # ожидания ввода
@@ -2380,24 +2441,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Парсим встречу с учётом типа чата
     if chat.type == "private":
-        candidates = []
-        for c in get_known_chats():
-            cid = c.get("chat_id")
-            try:
-                member = await context.bot.get_chat_member(cid, uid)
-                if member.status not in ("left", "kicked"):
-                    candidates.append(c)
-            except Exception:
-                continue
-        if candidates:
-            token = uuid.uuid4().hex
-            context.user_data.setdefault("pending_reminders", {})[token] = {"text": text_in}
-            candidates.append({"chat_id": chat_id, "title": "Личный чат"})
-            return await reply_text_safe(update.message,
-                "📨 Куда отправить напоминание?",
-                reply_markup=choose_chat_kb(candidates, token, is_admin=is_admin(user)),
+        tz_preview = resolve_tz_for_chat(chat_id)
+        looks_like_reminder = parse_meeting_message(text_in, tz_preview) is not None
+        last_target = await _get_valid_last_target(update, context)
+        force_pick = bool(context.user_data.get("force_pick"))
+
+        if looks_like_reminder and last_target and not force_pick:
+            await schedule_reminder_core(
+                text_in,
+                last_target.get("chat_id"),
+                update,
+                context,
+                user,
+                topic_override=last_target.get("topic_id"),
             )
+            context.user_data["force_pick"] = False
+            context.user_data["last_target"] = last_target
+            return
+
+        candidates = []
+        if looks_like_reminder:
+            for c in get_known_chats():
+                cid = c.get("chat_id")
+                try:
+                    member = await context.bot.get_chat_member(cid, uid)
+                    if member.status not in ("left", "kicked"):
+                        candidates.append(c)
+                except Exception:
+                    continue
+            if candidates and (force_pick or not last_target):
+                token = uuid.uuid4().hex
+                context.user_data.setdefault("pending_reminders", {})[token] = {"text": text_in}
+                candidates.append({"chat_id": chat_id, "title": "Личный чат"})
+                return await reply_text_safe(update.message,
+                    "📨 Куда отправить напоминание?",
+                    reply_markup=choose_chat_kb(candidates, token, is_admin=is_admin(user)),
+                )
+
         await schedule_reminder_core(text_in, chat_id, update, context, user)
+        if looks_like_reminder:
+            context.user_data["last_target"] = {"chat_id": chat_id, "topic_id": None}
+            context.user_data["force_pick"] = False
         return
 
     if chat.type in ("group", "supergroup"):
