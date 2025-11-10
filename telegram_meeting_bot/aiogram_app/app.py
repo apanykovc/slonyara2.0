@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
 
 import pytz
+from html import escape
 from aiohttp import ClientError
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -17,7 +18,14 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, Telegra
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardMarkup, Message, User
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    ChatMemberUpdated,
+    InlineKeyboardMarkup,
+    Message,
+    User,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from tzlocal import get_localzone_name
@@ -106,6 +114,18 @@ def _can_manage_settings(user: Optional[User], chat: Optional[Any]) -> bool:
     if chat_type == "private":
         return True
     return _is_admin(user)
+
+
+def _serialize_user(user: Optional[User]) -> Optional[Dict[str, Any]]:
+    if user is None:
+        return None
+    return {
+        "user_id": user.id,
+        "username": user.username,
+        "full_name": user.full_name,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+    }
 
 
 def _paginate_jobs(
@@ -791,6 +811,36 @@ async def _show_admins(message: Message) -> None:
     except TelegramBadRequest:
         await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
+
+async def _show_archive(
+    message: Message,
+    user: Optional[User],
+    *,
+    page: int = 1,
+    notice: Optional[str] = None,
+) -> None:
+    can_manage = _can_manage_settings(user, message.chat)
+    items, total, actual_page, pages_total = storage.get_archive_page(page, constants.PAGE_SIZE)
+    text = ui_txt.render_archive_text(
+        items,
+        total,
+        actual_page,
+        pages_total,
+        page_size=constants.PAGE_SIZE,
+    )
+    if notice:
+        text = f"{text}\n\n<i>{escape(notice)}</i>"
+    kb = ui_kb.archive_kb(
+        actual_page,
+        pages_total,
+        has_entries=bool(items),
+        can_clear=can_manage and total > 0,
+    )
+    try:
+        await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
 def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
     try:
         return storage.get_job_record(job_id)
@@ -799,8 +849,17 @@ def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _remove_job(job_id: str) -> None:
-    storage.remove_job_record(job_id)
+def _remove_job(
+    job_id: str,
+    *,
+    archive_reason: Optional[str] = None,
+    record: Optional[Dict[str, Any]] = None,
+    removed_by: Optional[Dict[str, Any]] = None,
+) -> None:
+    if archive_reason:
+        storage.archive_job(job_id, rec=record, reason=archive_reason, removed_by=removed_by)
+    else:
+        storage.remove_job_record(job_id)
     with suppress(Exception):
         scheduler.remove_job(job_id)
 
@@ -881,7 +940,7 @@ async def send_reminder_job(job_id: str | None = None, **_: Any) -> None:
             reason="repeat",
         )
     else:
-        _remove_job(job_id)
+        _remove_job(job_id, archive_reason="completed", record=job)
 
 
 def restore_jobs() -> None:
@@ -898,6 +957,27 @@ def restore_jobs() -> None:
             asyncio.create_task(send_reminder_job(job_id))
         elif delay > 0:
             _schedule_job(job_id, run_at)
+
+
+@router.my_chat_member()
+async def on_my_chat_member(event: ChatMemberUpdated) -> None:
+    new_status = getattr(event.new_chat_member, "status", None)
+    if new_status not in {"left", "kicked"}:
+        return
+    chat = event.chat
+    if chat is None:
+        return
+    records = storage.get_jobs_for_chat(chat.id)
+    if not records:
+        return
+    removed_by = _serialize_user(event.from_user)
+    reason = "bot_removed" if new_status in {"left", "kicked"} else "chat_removed"
+    for rec in records:
+        job_id = rec.get("job_id")
+        if not job_id:
+            continue
+        _remove_job(job_id, archive_reason=reason, record=rec, removed_by=removed_by)
+
 
 # === Commands ===
 
@@ -1278,6 +1358,53 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         await _callback_answer_safe(query)
         return
 
+    if data == constants.CB_ARCHIVE:
+        if not _can_manage_settings(user, message.chat):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
+        await _show_archive(message, user, page=1)
+        await _callback_answer_safe(query)
+        return
+
+    if data.startswith(f"{constants.CB_ARCHIVE_PAGE}:"):
+        if not _can_manage_settings(user, message.chat):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
+        try:
+            page = int(data.split(":", 1)[1])
+        except Exception:
+            page = 1
+        await _show_archive(message, user, page=page)
+        await _callback_answer_safe(query)
+        return
+
+    if data == constants.CB_ARCHIVE_CLEAR:
+        if not _can_manage_settings(user, message.chat):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
+        text = "<b>Очистить архив?</b>\nЭто действие необратимо."
+        kb = ui_kb.archive_clear_confirm_kb()
+        try:
+            await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except TelegramBadRequest:
+            await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await _callback_answer_safe(query)
+        return
+
+    if data == constants.CB_ARCHIVE_CLEAR_CONFIRM:
+        if not _can_manage_settings(user, message.chat):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
+        removed = storage.clear_archive()
+        notice = "Архив очищен." if removed else "Архив уже пуст."
+        await _show_archive(message, user, page=1, notice=notice)
+        await _callback_answer_safe(query)
+        return
+
     if data.startswith(f"{constants.CB_CHAT_DEL}:"):
         if not _is_admin(user):
             await _answer_safe(message, "⛔ Только администратор может менять настройки.")
@@ -1288,6 +1415,18 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         topic_id = int(parts[2]) if len(parts) > 2 else 0
         if chat_id is not None:
             storage.unregister_chat(chat_id, topic_id if topic_id else None)
+            removed_by = _serialize_user(user)
+            affected = storage.get_jobs_for_chat(chat_id, topic_id if topic_id else None)
+            for rec in affected:
+                job_id = rec.get("job_id")
+                if not job_id:
+                    continue
+                _remove_job(
+                    job_id,
+                    archive_reason="chat_unregistered",
+                    record=rec,
+                    removed_by=removed_by,
+                )
             await _show_chats(message)
         await _callback_answer_safe(query, "Удалено")
         return
@@ -1381,7 +1520,15 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
     if data.startswith(f"{constants.CB_CANCEL}:"):
         job_id = data.split(":", 1)[1]
         job = _get_job(job_id)
-        _remove_job(job_id)
+        if job:
+            _remove_job(
+                job_id,
+                archive_reason="manual_cancel",
+                record=job,
+                removed_by=_serialize_user(user),
+            )
+        else:
+            _remove_job(job_id)
         if job:
             audit_log(
                 "REM_CANCELED",

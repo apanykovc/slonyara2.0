@@ -20,6 +20,7 @@ import asyncio
 import os
 import re
 import uuid
+from html import escape
 import json
 import logging
 import contextvars
@@ -50,6 +51,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     CommandHandler,
+    ChatMemberHandler,
     filters,
 )
 from telegram.request import HTTPXRequest
@@ -71,6 +73,7 @@ from ..core.constants import (
     CB_CANCEL, CB_SHIFT, CB_SENDNOW, CB_PICK_CHAT, CB_RRULE,
     CB_ACTIONS, CB_DISABLED,
     CB_ADMINS, CB_ADMIN_ADD, CB_ADMIN_DEL,
+    CB_ARCHIVE, CB_ARCHIVE_CLEAR, CB_ARCHIVE_CLEAR_CONFIRM, CB_ARCHIVE_PAGE,
     CB_CHATS, CB_CHAT_DEL,
     RR_ONCE, RR_DAILY, RR_WEEKLY,
     AWAIT_TZ, AWAIT_ADMIN,
@@ -83,15 +86,33 @@ from ..core.constants import (
     OWNER_USERNAMES,
 )
 from ..core.storage import (
-    get_cfg, set_cfg, get_chat_cfg_entry, update_chat_cfg,
-    get_jobs_store, set_jobs_store, add_job_record, remove_job_record,
-    get_job_record, upsert_job_record, find_job_by_text,
-    resolve_tz_for_chat, get_offset_for_chat,
-    get_known_chats, register_chat, unregister_chat,
+    archive_job,
+    archive_jobs_for_chat,
+    get_archive_page,
+    get_cfg,
+    set_cfg,
+    get_chat_cfg_entry,
+    update_chat_cfg,
+    get_jobs_for_chat,
+    get_jobs_store,
+    set_jobs_store,
+    add_job_record,
+    remove_job_record,
+    get_job_record,
+    upsert_job_record,
+    find_job_by_text,
+    resolve_tz_for_chat,
+    get_offset_for_chat,
+    get_known_chats,
+    register_chat,
+    unregister_chat,
+    clear_archive,
     add_admin_username, remove_admin_username,
 )
 from ..ui.keyboards import (
     actions_kb,
+    archive_clear_confirm_kb,
+    archive_kb,
     active_kb,
     admins_menu_kb,
     chats_menu_kb,
@@ -105,8 +126,15 @@ from ..ui.keyboards import (
     tz_menu_kb,
 )
 from ..ui.texts import (
-    menu_text_for, show_help_text, format_job_line, render_panel_text,
-    render_admins_text, render_active_text, escape_md, create_reminder_hint,
+    menu_text_for,
+    show_help_text,
+    format_job_line,
+    render_panel_text,
+    render_admins_text,
+    render_active_text,
+    render_archive_text,
+    escape_md,
+    create_reminder_hint,
 )
 # ==========================
 # ----- КОНФИГ И ЛОГИ -----
@@ -131,6 +159,18 @@ def _current_user_tag() -> Optional[str]:
 
 def _iso_ts() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat()
+
+
+def _serialize_user(user: Optional[User]) -> Optional[Dict[str, Any]]:
+    if user is None:
+        return None
+    return {
+        "user_id": user.id,
+        "username": user.username,
+        "full_name": user.full_name,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+    }
 
 
 class AuditJSONFormatter(logging.Formatter):
@@ -737,6 +777,46 @@ def _slice_jobs(jobs_all: list[dict], page: int) -> tuple[list[dict], int, int]:
     start = (page - 1) * PAGE_SIZE
     chunk = jobs_all[start:start + PAGE_SIZE]
     return chunk, page, pages_total
+
+
+async def _show_archive_view(
+    q: CallbackQuery,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    page: int,
+    can_manage: bool,
+    notice: str | None = None,
+) -> None:
+    items, total, actual_page, pages_total = get_archive_page(page, PAGE_SIZE)
+    text_out = render_archive_text(
+        items,
+        total,
+        actual_page,
+        pages_total,
+        page_size=PAGE_SIZE,
+    )
+    if notice:
+        text_out = f"{text_out}\n\n<i>{escape(notice)}</i>"
+    markup = archive_kb(
+        actual_page,
+        pages_total,
+        has_entries=bool(items),
+        can_clear=can_manage and total > 0,
+    )
+    try:
+        await edit_text_safe(
+            q.edit_message_text,
+            text_out,
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+    except Exception:
+        await reply_text_safe(
+            q.message,
+            text_out,
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
 
 
 async def _build_active_payload(
@@ -1718,6 +1798,58 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             await reply_text_safe(q.message, text, reply_markup=chats_menu_kb(known), parse_mode="Markdown")
         return
 
+    if data == CB_ARCHIVE:
+        if not can_manage:
+            msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
+            auto_delete(msg, context)
+            return
+        await _show_archive_view(q, context, page=1, can_manage=can_manage)
+        return
+
+    if data.startswith(f"{CB_ARCHIVE_PAGE}:"):
+        if not can_manage:
+            msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
+            auto_delete(msg, context)
+            return
+        try:
+            page = int(data.split(":", 1)[1])
+        except Exception:
+            page = 1
+        await _show_archive_view(q, context, page=page, can_manage=can_manage)
+        return
+
+    if data == CB_ARCHIVE_CLEAR:
+        if not can_manage:
+            msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
+            auto_delete(msg, context)
+            return
+        text = "<b>Очистить архив?</b>\nЭто действие необратимо."
+        try:
+            await edit_text_safe(
+                q.edit_message_text,
+                text,
+                reply_markup=archive_clear_confirm_kb(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            await reply_text_safe(
+                q.message,
+                text,
+                reply_markup=archive_clear_confirm_kb(),
+                parse_mode="HTML",
+            )
+        return
+
+    if data == CB_ARCHIVE_CLEAR_CONFIRM:
+        if not can_manage:
+            msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
+            auto_delete(msg, context)
+            return
+        removed = clear_archive()
+        notice = "Архив очищен." if removed else "Архив уже пуст."
+        await _show_archive_view(q, context, page=1, can_manage=can_manage, notice=notice)
+        return
+
     if data.startswith(f"{CB_CHAT_DEL}:"):
         if not is_admin(user):
             msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
@@ -1730,6 +1862,22 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         topic = parts[2]
         topic_val = None if topic == "0" else int(topic)
         unregister_chat(sel, topic_val)
+        removed_by = _serialize_user(user)
+        affected = get_jobs_for_chat(sel, topic_val)
+        for rec in affected:
+            job_id = rec.get("job_id")
+            if not job_id:
+                continue
+            jobs = context.job_queue.get_jobs_by_name(job_id)
+            for job in jobs:
+                job.schedule_removal()
+            release_signature(rec.get("signature"))
+            archive_job(
+                job_id,
+                rec=rec,
+                reason="chat_unregistered",
+                removed_by=removed_by,
+            )
         known = get_known_chats()
         text = "🗑️ Чат удалён"
         try:
@@ -1818,7 +1966,16 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             jobs[0].schedule_removal()
         if rec:
             release_signature(rec.get("signature"))
-        remove_job_record(job_id)
+        removed = False
+        if rec:
+            removed = archive_job(
+                job_id,
+                rec=rec,
+                reason="manual_cancel",
+                removed_by=_serialize_user(user),
+            )
+        if not removed:
+            remove_job_record(job_id)
         if rec and rec.get("confirm_chat_id") and rec.get("confirm_message_id"):
             try:
                 await edit_text_safe(
@@ -2107,7 +2264,11 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
         if rec:
             release_signature(rec.get("signature"))
-        remove_job_record(job_id)
+        removed = False
+        if rec:
+            removed = archive_job(job_id, rec=rec, reason="completed")
+        if not removed:
+            remove_job_record(job_id)
         # Обновить подтверждение и панель
         if rec and rec.get("confirm_chat_id") and rec.get("confirm_message_id"):
             try:
@@ -2125,6 +2286,34 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         if src_chat:
             dummy = SimpleNamespace(effective_chat=SimpleNamespace(id=src_chat), effective_message=None)
             await ensure_panel(dummy, context)
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _set_log_user(update)
+    change = update.my_chat_member
+    if not change:
+        return
+    new_status = getattr(change.new_chat_member, "status", None)
+    if new_status not in {"left", "kicked"}:
+        return
+    chat = change.chat
+    if not chat:
+        return
+    chat_id = chat.id
+    records = get_jobs_for_chat(chat_id)
+    if not records:
+        return
+    removed_by = _serialize_user(change.from_user)
+    reason = "bot_removed" if new_status in {"left", "kicked"} else "chat_removed"
+    for rec in records:
+        job_id = rec.get("job_id")
+        if not job_id:
+            continue
+        jobs = context.job_queue.get_jobs_by_name(job_id)
+        for job in jobs:
+            job.schedule_removal()
+        release_signature(rec.get("signature"))
+        archive_job(job_id, rec=rec, reason=reason, removed_by=removed_by)
 
 
 # ==========================
@@ -2693,6 +2882,7 @@ def main() -> None:
     # колбэки
     app.add_handler(CallbackQueryHandler(on_noop, pattern=rf"^{CB_DISABLED}(?::.*)?$"))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, chat_member_types=ChatMemberHandler.MY_CHAT_MEMBER))
     # текст
     app.add_handler(
         MessageHandler(

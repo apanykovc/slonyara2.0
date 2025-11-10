@@ -135,6 +135,10 @@ CB_OFF_PRESET_30 = "off_p30"
 
 CB_CHATS = "chats"            # список зарегистрированных чатов
 CB_CHAT_DEL = "chat_del"      # chat_del:<chat_id>:<topic_id>
+CB_ARCHIVE = "archive"
+CB_ARCHIVE_PAGE = "archive_page"
+CB_ARCHIVE_CLEAR = "archive_clear"
+CB_ARCHIVE_CLEAR_CONFIRM = "archive_clear_yes"
 
 CB_CANCEL = "cancel"  # cancel:<id_задачи>
 CB_SHIFT = "shift"    # shift:<id_задачи>:минуты

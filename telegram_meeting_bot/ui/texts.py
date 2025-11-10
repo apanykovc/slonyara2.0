@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable
 
 import pytz
 
-from ..core.constants import RR_DAILY, RR_ONCE, RR_WEEKLY, VERSION
+from ..core.constants import PAGE_SIZE, RR_DAILY, RR_ONCE, RR_WEEKLY, VERSION
 from ..core.storage import (
     get_jobs_store,
     get_known_chats,
@@ -173,6 +173,141 @@ def render_active_text(
     if len(lines) == 1:
         lines.append("")
         lines.append(escape(empty_message))
+    return "\n".join(lines)
+
+
+def render_archive_text(
+    items: Iterable[Dict[str, Any]],
+    total: int,
+    page: int,
+    pages_total: int,
+    *,
+    title: str = "📦 Архив",
+    empty_message: str = "Архив пуст.",
+    page_size: int = PAGE_SIZE,
+) -> str:
+    """Сформировать HTML для списка архивных напоминаний."""
+
+    entries = list(items)
+    safe_title = escape(title)
+    header = (
+        f"<b>{safe_title}</b> ({escape(str(total))}), страница "
+        f"<b>{escape(str(page))}/{escape(str(pages_total))}</b>:"
+    )
+    lines: list[str] = [header]
+    if not entries:
+        lines.append("")
+        lines.append(escape(empty_message))
+        return "\n".join(lines)
+
+    known = get_known_chats()
+    reason_labels = {
+        "completed": "✅ Завершено",
+        "manual_cancel": "❌ Отменено вручную",
+        "chat_removed": "🚫 Чат недоступен",
+        "bot_removed": "🚫 Бот исключён",
+        "chat_unregistered": "🗑️ Чат удалён из настроек",
+    }
+
+    def _parse_iso(value: Any) -> datetime | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=pytz.utc)
+        return dt
+
+    index_offset = max(page - 1, 0) * max(page_size, 1)
+
+    for index, entry in enumerate(entries, start=1 + index_offset):
+        target_title = entry.get("target_title")
+        chat_id = entry.get("target_chat_id")
+        if not target_title:
+            target_title = next(
+                (c.get("title") for c in known if str(c.get("chat_id")) == str(chat_id)),
+                str(chat_id),
+            )
+
+        tz = pytz.utc
+        tz_chat_id: int | None = None
+        if isinstance(chat_id, int):
+            tz_chat_id = chat_id
+        else:
+            try:
+                tz_chat_id = int(chat_id)
+            except (TypeError, ValueError):
+                tz_chat_id = None
+        if tz_chat_id is not None:
+            try:
+                tz = resolve_tz_for_chat(tz_chat_id)
+            except Exception:
+                tz = pytz.utc
+
+        archived_dt = _parse_iso(entry.get("archived_at_utc") or entry.get("archived_at"))
+        archived_text = (
+            archived_dt.astimezone(tz).strftime("%d.%m %H:%M %Z")
+            if archived_dt is not None
+            else entry.get("archived_at_utc") or ""
+        )
+
+        run_dt = _parse_iso(entry.get("run_at_utc"))
+        run_text = (
+            run_dt.astimezone(tz).strftime("%d.%m %H:%M %Z")
+            if run_dt is not None
+            else entry.get("run_at_utc") or ""
+        )
+
+        topic_title = entry.get("topic_title")
+        if not topic_title:
+            rec_topic = entry.get("topic_id")
+            if rec_topic is not None:
+                topic_title = next(
+                    (
+                        c.get("topic_title")
+                        for c in known
+                        if str(c.get("chat_id")) == str(chat_id)
+                        and int(c.get("topic_id", 0) or 0) == int(rec_topic or 0)
+                    ),
+                    None,
+                )
+
+        text = entry.get("text") or ""
+        reason = entry.get("archive_reason") or "completed"
+        reason_label = reason_labels.get(reason, "📦 Архивировано")
+        removed_by = entry.get("removed_by") if isinstance(entry.get("removed_by"), dict) else None
+        remover_text = ""
+        if isinstance(removed_by, dict):
+            username = removed_by.get("username")
+            full_name = removed_by.get("full_name")
+            user_id = removed_by.get("user_id")
+            if username:
+                remover_text = f"@{username}"
+            elif full_name:
+                remover_text = str(full_name)
+            elif user_id:
+                remover_text = str(user_id)
+            if user_id and remover_text and str(user_id) not in remover_text:
+                remover_text = f"{remover_text} (ID: {user_id})"
+
+        lines.extend(
+            [
+                "",
+                f"{index}) <b>{escape(str(target_title))}</b>",
+                escape(text),
+            ]
+        )
+        if topic_title:
+            lines.append(f"Тема: {escape(str(topic_title))}")
+        if run_text:
+            lines.append(f"Напоминание планировалось на {escape(str(run_text))}")
+        if archived_text:
+            lines.append(f"{escape(reason_label)}: {escape(str(archived_text))}")
+        if remover_text:
+            lines.append(f"Инициатор: {escape(remover_text)}")
+
     return "\n".join(lines)
 
 

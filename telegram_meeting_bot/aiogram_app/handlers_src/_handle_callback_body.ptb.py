@@ -9,6 +9,17 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
     admin = is_admin(user)
     data = q.data
 
+    def _user_payload(u: User | None) -> dict[str, Any] | None:
+        if u is None:
+            return None
+        return {
+            "user_id": u.id,
+            "username": u.username,
+            "full_name": u.full_name,
+            "first_name": u.first_name,
+            "last_name": u.last_name,
+        }
+
     if data.startswith(f"{CB_PICK_CHAT}:"):
         parts = data.split(":", 3)
         if len(parts) < 4:
@@ -275,6 +286,78 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             await reply_text_safe(q.message, text, reply_markup=chats_menu_kb(known), parse_mode="Markdown")
         return
 
+    if data == CB_ARCHIVE:
+        if not is_admin(user):
+            msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
+            auto_delete(msg, context)
+            return
+        items, total, page, pages_total = get_archive_page(1, PAGE_SIZE)
+        text = render_archive_text(items, total, page, pages_total, page_size=PAGE_SIZE)
+        markup = archive_kb(page, pages_total, has_entries=bool(items), can_clear=True and total > 0)
+        try:
+            await edit_text_safe(q.edit_message_text, text, reply_markup=markup, parse_mode="HTML")
+        except Exception:
+            await reply_text_safe(q.message, text, reply_markup=markup, parse_mode="HTML")
+        return
+
+    if data.startswith(f"{CB_ARCHIVE_PAGE}:"):
+        if not is_admin(user):
+            msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
+            auto_delete(msg, context)
+            return
+        try:
+            page_req = int(data.split(":", 1)[1])
+        except Exception:
+            page_req = 1
+        items, total, page, pages_total = get_archive_page(page_req, PAGE_SIZE)
+        text = render_archive_text(items, total, page, pages_total, page_size=PAGE_SIZE)
+        markup = archive_kb(page, pages_total, has_entries=bool(items), can_clear=True and total > 0)
+        try:
+            await edit_text_safe(q.edit_message_text, text, reply_markup=markup, parse_mode="HTML")
+        except Exception:
+            await reply_text_safe(q.message, text, reply_markup=markup, parse_mode="HTML")
+        return
+
+    if data == CB_ARCHIVE_CLEAR:
+        if not is_admin(user):
+            msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
+            auto_delete(msg, context)
+            return
+        text = "<b>Очистить архив?</b>\nЭто действие необратимо."
+        try:
+            await edit_text_safe(
+                q.edit_message_text,
+                text,
+                reply_markup=archive_clear_confirm_kb(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            await reply_text_safe(
+                q.message,
+                text,
+                reply_markup=archive_clear_confirm_kb(),
+                parse_mode="HTML",
+            )
+        return
+
+    if data == CB_ARCHIVE_CLEAR_CONFIRM:
+        if not is_admin(user):
+            msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
+            auto_delete(msg, context)
+            return
+        removed = clear_archive()
+        notice = "Архив очищен." if removed else "Архив уже пуст."
+        items, total, page, pages_total = get_archive_page(1, PAGE_SIZE)
+        base_text = render_archive_text(items, total, page, pages_total, page_size=PAGE_SIZE)
+        if notice:
+            base_text = f"{base_text}\n\n<i>{notice}</i>"
+        markup = archive_kb(page, pages_total, has_entries=bool(items), can_clear=True and total > 0)
+        try:
+            await edit_text_safe(q.edit_message_text, base_text, reply_markup=markup, parse_mode="HTML")
+        except Exception:
+            await reply_text_safe(q.message, base_text, reply_markup=markup, parse_mode="HTML")
+        return
+
     if data.startswith(f"{CB_CHAT_DEL}:"):
         if not is_admin(user):
             msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
@@ -287,6 +370,22 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         topic = parts[2]
         topic_val = None if topic == "0" else int(topic)
         unregister_chat(sel, topic_val)
+        removed_by = _user_payload(user)
+        affected = get_jobs_for_chat(sel, topic_val)
+        for rec in affected:
+            job_id = rec.get("job_id")
+            if not job_id:
+                continue
+            jobs = context.job_queue.get_jobs_by_name(job_id)
+            for job in jobs:
+                job.schedule_removal()
+            release_signature(rec.get("signature"))
+            archive_job(
+                job_id,
+                rec=rec,
+                reason="chat_unregistered",
+                removed_by=removed_by,
+            )
         known = get_known_chats()
         text = "🗑️ Чат удалён"
         try:
@@ -375,7 +474,16 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             jobs[0].schedule_removal()
         if rec:
             release_signature(rec.get("signature"))
-        remove_job_record(job_id)
+        removed = False
+        if rec:
+            removed = archive_job(
+                job_id,
+                rec=rec,
+                reason="manual_cancel",
+                removed_by=_user_payload(user),
+            )
+        if not removed:
+            remove_job_record(job_id)
         if rec and rec.get("confirm_chat_id") and rec.get("confirm_message_id"):
             try:
                 await edit_text_safe(
