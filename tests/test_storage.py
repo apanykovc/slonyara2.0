@@ -61,3 +61,15 @@ def test_register_chat_updates_topic_title(tmp_path: Path):
 
     chats = _load_known_chats(path)
     assert chats[0]["topic_title"] == "New topic"
+
+
+def test_get_offset_defaults_to_30(monkeypatch: pytest.MonkeyPatch) -> None:
+    chat_id = 42
+    storage.update_chat_cfg(chat_id, offset="not-a-number")
+    assert storage.get_offset_for_chat(chat_id) == 30
+
+
+def test_normalize_offset_handles_invalid() -> None:
+    assert storage.normalize_offset(15) == 15
+    assert storage.normalize_offset(-5) == 0
+    assert storage.normalize_offset("bad", fallback=30) == 30
