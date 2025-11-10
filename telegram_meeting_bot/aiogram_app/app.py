@@ -119,6 +119,25 @@ def _paginate_jobs(
         jobs_filtered = [job for job in jobs_all if predicate(job)]
     else:
         jobs_filtered = jobs_all
+
+    def sort_key(job: Dict[str, Any]) -> tuple[float, str, str, str]:
+        run_iso = job.get("run_at_utc")
+        timestamp = float("inf")
+        if isinstance(run_iso, str) and run_iso:
+            try:
+                run_at = datetime.fromisoformat(run_iso)
+            except ValueError:
+                run_at = None
+            if run_at is not None:
+                if run_at.tzinfo is None:
+                    run_at = run_at.replace(tzinfo=timezone.utc)
+                timestamp = run_at.astimezone(timezone.utc).timestamp()
+        title = job.get("target_title") or str(job.get("target_chat_id") or "")
+        text = job.get("text") or ""
+        job_id = job.get("job_id") or ""
+        return timestamp, title, text, job_id
+
+    jobs_filtered.sort(key=sort_key)
     total = len(jobs_filtered)
     pages_total = max(1, (total + page_size - 1) // page_size) if total else 1
     page = max(1, min(page, pages_total))
@@ -559,18 +578,21 @@ async def schedule_reminder(
     user: Optional[User],
     text: str,
     topic_id: Optional[int] = None,
+    notify: bool = True,
 ) -> None:
     tz = storage.resolve_tz_for_chat(int(target_chat_id) if isinstance(target_chat_id, int) else source_chat_id)
     parsed = parse_meeting_message(text, tz)
     if not parsed:
-        await _answer_safe(message, 
-            "🙈 Не понял формат. Жду: `ДД.ММ ТИП ЧЧ:ММ ПЕРЕГ НОМЕР`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        if notify:
+            await _answer_safe(message,
+                "🙈 Не понял формат. Жду: `ДД.ММ ТИП ЧЧ:ММ ПЕРЕГ НОМЕР`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
         return
 
     if storage.find_job_by_text(parsed["reminder_text"]):
-        await _answer_safe(message, "⚠️ Такая напоминалка уже есть.")
+        if notify:
+            await _answer_safe(message, "⚠️ Такая напоминалка уже есть.")
         return
 
     cfg_chat_id = _extract_chat_id(target_chat_id)
@@ -611,7 +633,8 @@ async def schedule_reminder(
             user_id=getattr(user, "id", None),
         )
         await _send_safe(message.bot, target_chat_id, job_data["text"], message_thread_id=topic_id)
-        await _answer_safe(message, "✅ Напоминание уже должно было прийти — отправил сразу.")
+        if notify:
+            await _answer_safe(message, "✅ Напоминание уже должно было прийти — отправил сразу.")
         return
 
     _schedule_job(job_id, reminder_utc)
@@ -627,11 +650,12 @@ async def schedule_reminder(
         tz=getattr(tz, "zone", str(tz)),
         delay_sec=round((reminder_utc - now_utc).total_seconds(), 1),
     )
-    await _answer_safe(message, 
-        f"📌 Запланировано на {reminder_local:%d.%m %H:%M}\n{parsed['canonical_full']}",
-        reply_markup=ui_kb.job_kb(job_id) if _is_admin(user) else None,
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    if notify:
+        await _answer_safe(message,
+            f"📌 Запланировано на {reminder_local:%d.%m %H:%M}\n{parsed['canonical_full']}",
+            reply_markup=ui_kb.job_kb(job_id) if _is_admin(user) else None,
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 def _render_active(
     chunk: Iterable[Dict[str, Any]],
@@ -1058,6 +1082,7 @@ async def handle_group_text(message: Message) -> None:
         user=message.from_user,
         text=message.text.strip(),
         topic_id=message.message_thread_id,
+        notify=False,
     )
 
 # === Callback handling ===
