@@ -42,6 +42,8 @@ STATE_AWAIT_ADMIN_ADD = "await_admin"
 STATE_AWAIT_ADMIN_DEL = "await_admin_del"
 STATE_PENDING = "pending_reminders"
 STATE_REPLY_MENU_SHOWN = "reply_menu_shown"
+STATE_FORCE_PICK = "force_pick"
+STATE_LAST_TARGET = "last_target"
 
 
 REPLY_MENU_ACTIONS = {
@@ -435,6 +437,43 @@ async def _pick_target_for_private(message: Message, state: FSMContext, text: st
         reply_markup=ui_kb.choose_chat_kb(candidates, token, is_admin=_is_admin(message.from_user)),
     )
     return True
+
+
+async def _get_valid_last_target(
+    message: Message,
+    user: Optional[User],
+    state: FSMContext,
+    data: Dict[str, Any],
+) -> Optional[tuple[int | str, Optional[int]]]:
+    entry = data.get(STATE_LAST_TARGET)
+    if not isinstance(entry, dict):
+        return None
+    chat_id = entry.get("chat_id")
+    topic_id = entry.get("topic_id")
+    if chat_id is None:
+        return None
+    current_topic = message.message_thread_id or 0
+    if chat_id == message.chat.id and int(topic_id or 0) == int(current_topic):
+        return chat_id, topic_id
+
+    for candidate in storage.get_known_chats():
+        candidate_chat = candidate.get("chat_id")
+        candidate_topic = candidate.get("topic_id") or 0
+        if str(candidate_chat) != str(chat_id) or int(candidate_topic) != int(topic_id or 0):
+            continue
+        if not user or not isinstance(chat_id, int):
+            return chat_id, topic_id
+        member = await _telegram_call(
+            lambda: message.bot.get_chat_member(chat_id, user.id),
+            description="bot.get_chat_member",
+            swallow_bad_request=True,
+        )
+        if member and member.status not in {"left", "kicked"}:
+            return chat_id, topic_id
+        break
+
+    await state.update_data({STATE_LAST_TARGET: None})
+    return None
 
 
 async def schedule_reminder(
@@ -837,18 +876,22 @@ async def handle_private_text(message: Message, state: FSMContext) -> None:
 
     await _ensure_reply_menu(message, state)
 
+    force_pick = bool(data.get(STATE_FORCE_PICK))
+    last_target = await _get_valid_last_target(message, message.from_user, state, data)
+
     action = REPLY_MENU_ALIASES.get(text.casefold())
     if action:
         await _reset_interaction_state(state)
         user = message.from_user
         if action == "menu":
             menu_text = ui_txt.menu_text_for(message.chat.id)
-            await _answer_safe(message, 
+            await _answer_safe(message,
                 menu_text,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=ui_kb.main_menu_kb(_is_admin(user)),
             )
         elif action == "create":
+            await state.update_data({STATE_FORCE_PICK: True})
             await _show_create_hint(message, user)
         elif action == "my":
             await _show_active(message, user, page=1, mine=True)
@@ -866,7 +909,23 @@ async def handle_private_text(message: Message, state: FSMContext) -> None:
         await _ensure_reply_menu(message, state)
         return
 
-    if await _pick_target_for_private(message, state, text):
+    tz_preview = storage.resolve_tz_for_chat(message.chat.id)
+    looks_like_reminder = parse_meeting_message(text, tz_preview) is not None
+
+    if looks_like_reminder and last_target and not force_pick:
+        target_chat_id, topic_id = last_target
+        await schedule_reminder(
+            message=message,
+            source_chat_id=message.chat.id,
+            target_chat_id=target_chat_id,
+            user=message.from_user,
+            text=text,
+            topic_id=topic_id,
+        )
+        await state.update_data({STATE_FORCE_PICK: False, STATE_LAST_TARGET: {"chat_id": target_chat_id, "topic_id": topic_id}})
+        return
+
+    if looks_like_reminder and await _pick_target_for_private(message, state, text):
         return
 
     await schedule_reminder(
@@ -877,6 +936,12 @@ async def handle_private_text(message: Message, state: FSMContext) -> None:
         text=text,
         topic_id=message.message_thread_id,
     )
+
+    if looks_like_reminder:
+        await state.update_data({
+            STATE_LAST_TARGET: {"chat_id": message.chat.id, "topic_id": message.message_thread_id},
+            STATE_FORCE_PICK: False,
+        })
 
 
 @router.message(F.chat.type.in_({"group", "supergroup"}), F.text)
@@ -953,6 +1018,7 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         return
 
     if data == constants.CB_CREATE:
+        await state.update_data({STATE_FORCE_PICK: True})
         await _show_create_hint(message, user)
         await _ensure_reply_menu(message, state)
         await _callback_answer_safe(query)
@@ -1149,6 +1215,10 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             text=entry.get("text", ""),
             topic_id=topic_id,
         )
+        await state.update_data({
+            STATE_LAST_TARGET: {"chat_id": chat_id, "topic_id": topic_id},
+            STATE_FORCE_PICK: False,
+        })
         await _callback_answer_safe(query, "Готово")
         return
 
