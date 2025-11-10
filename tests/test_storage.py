@@ -11,6 +11,7 @@ if "pytz" not in sys.modules:
     pytz_stub = types.ModuleType("pytz")
     pytz_stub.BaseTzInfo = object  # type: ignore[attr-defined]
     pytz_stub.timezone = lambda name: name  # type: ignore[assignment]
+    pytz_stub.utc = "UTC"
     sys.modules["pytz"] = pytz_stub
 
 if "tzlocal" not in sys.modules:
@@ -73,3 +74,38 @@ def test_normalize_offset_handles_invalid() -> None:
     assert storage.normalize_offset(15) == 15
     assert storage.normalize_offset(-5) == 0
     assert storage.normalize_offset("bad", fallback=30) == 30
+
+
+def test_resolve_tz_uses_default_moscow(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ORG_TZ", raising=False)
+    monkeypatch.setattr(storage, "DEFAULT_TZ_NAME", "Europe/Moscow", raising=False)
+    monkeypatch.setattr(storage, "get_chat_cfg_entry", lambda _cid: {})
+    assert storage.resolve_tz_for_chat(100) == "Europe/Moscow"
+
+
+def test_resolve_tz_invalid_chat_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_timezone(name: str) -> str:
+        if name == "Bad/Zone":
+            raise ValueError("invalid tz")
+        return name
+
+    monkeypatch.setattr(storage.pytz, "timezone", fake_timezone)
+    monkeypatch.delenv("ORG_TZ", raising=False)
+    monkeypatch.setattr(storage, "DEFAULT_TZ_NAME", "Europe/Moscow", raising=False)
+    monkeypatch.setattr(storage, "get_chat_cfg_entry", lambda _cid: {"tz": "Bad/Zone"})
+
+    assert storage.resolve_tz_for_chat(200) == "Europe/Moscow"
+
+
+def test_resolve_tz_invalid_default_uses_utc(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_timezone(name: str) -> str:
+        if name in {"Bad/Zone", "Wrong/Zone"}:
+            raise ValueError("invalid tz")
+        return name
+
+    monkeypatch.setattr(storage.pytz, "timezone", fake_timezone)
+    monkeypatch.setenv("ORG_TZ", "Wrong/Zone")
+    monkeypatch.setattr(storage, "DEFAULT_TZ_NAME", "", raising=False)
+    monkeypatch.setattr(storage, "get_chat_cfg_entry", lambda _cid: {"tz": "Bad/Zone"})
+
+    assert storage.resolve_tz_for_chat(300) == storage.pytz.utc
