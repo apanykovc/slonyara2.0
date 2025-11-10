@@ -16,6 +16,9 @@ def _int_from_env(name: str, default: int) -> int:
 
 VERSION = "2.5.0"
 
+# Таймзона по умолчанию для организации (можно переопределить переменной окружения)
+DEFAULT_TZ_NAME = os.environ.get("ORG_TZ_DEFAULT", "Europe/Moscow")
+
 # Токен бота (задан напрямую в коде)
 BOT_TOKEN = "8338879451:AAGTkri6ZXXD88eLAbuOIIqLSVHCoNabVrU"
 

@@ -13,6 +13,7 @@ from .constants import (
     ADMINS_PATH,
     ADMIN_USERNAMES,
     CFG_PATH,
+    DEFAULT_TZ_NAME,
     JOBS_DB_PATH,
     LEGACY_JOBS_PATH,
     TARGETS_PATH,
@@ -207,15 +208,44 @@ def upsert_job_record(job_id: str, updates: Dict[str, Any]) -> None:
 
 # Настройки чата ---------------------------------------------------------
 
+def get_org_tz_name() -> str:
+    """Вернуть таймзону организации с учётом окружения и дефолта."""
+
+    env_tz = os.environ.get("ORG_TZ")
+    if env_tz:
+        return env_tz
+    if DEFAULT_TZ_NAME:
+        return DEFAULT_TZ_NAME
+    try:
+        return get_localzone_name()
+    except Exception as exc:
+        logger.warning("Не удалось определить локальную TZ (%s), используем UTC.", exc)
+        return "UTC"
+
+
 def resolve_tz_for_chat(chat_id: int) -> pytz.BaseTzInfo:
     entry = get_chat_cfg_entry(chat_id)
     tz_name = entry.get("tz")
-    if not tz_name:
-        tz_name = os.environ.get("ORG_TZ") or get_localzone_name()
+    if tz_name:
+        try:
+            return pytz.timezone(tz_name)
+        except Exception as e:
+            logger.warning(
+                "Некорректная TZ '%s' для чата %s (%s). Используем дефолт.",
+                tz_name,
+                chat_id,
+                e,
+            )
+
+    fallback_tz = get_org_tz_name()
     try:
-        return pytz.timezone(tz_name)
+        return pytz.timezone(fallback_tz)
     except Exception as e:
-        logger.warning("Некорректная TZ '%s' для чата %s (%s). Падаем на UTC.", tz_name, chat_id, e)
+        logger.warning(
+            "Некорректная дефолтная TZ '%s' (%s). Падаем на UTC.",
+            fallback_tz,
+            e,
+        )
         return pytz.utc
 
 
