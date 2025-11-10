@@ -1073,7 +1073,8 @@ async def edit_markup_safe(func, *, fast_retry: bool = False, **kwargs):
 
 
 # --- Очередь отправки с ограничением скорости ---
-SEND_INTERVAL = 0.3  # WHY: 300 мс между задачами отправки снижает риск перегрузки
+SEND_INTERVAL = 0.12  # WHY: сокращаем задержку до ~120 мс, не выходя за безопасный лимит Telegram
+SEND_BURST = 3  # WHY: обрабатываем несколько сообщений за тик без избыточной задержки
 
 
 async def process_send_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1082,14 +1083,19 @@ async def process_send_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
     queue: asyncio.Queue = context.application.bot_data.setdefault(
         "send_queue", asyncio.Queue()
     )
-    if queue.empty():
-        return
-    try:
-        chat_id, text, topic_id = queue.get_nowait()
-    except asyncio.QueueEmpty:
+    deliveries: list[tuple[int, str, Optional[int]]] = []
+    for _ in range(SEND_BURST):
+        if queue.empty():
+            break
+        try:
+            deliveries.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    if not deliveries:
         return
 
-    async def _deliver() -> None:
+    async def _deliver(chat_id: int, text: str, topic_id: Optional[int]) -> None:
         try:
             await safe_send_message(
                 context,
@@ -1108,7 +1114,8 @@ async def process_send_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
         finally:
             queue.task_done()
 
-    context.application.create_task(_deliver())
+    for chat_id, text, topic_id in deliveries:
+        context.application.create_task(_deliver(chat_id, text, topic_id))
 
 
 async def cleanup_logs_job(_context: ContextTypes.DEFAULT_TYPE) -> None:
