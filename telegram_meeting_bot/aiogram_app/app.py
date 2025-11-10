@@ -101,6 +101,13 @@ def _is_owner(user: Optional[User]) -> bool:
     return username in owners or _is_admin(user)
 
 
+def _can_manage_settings(user: Optional[User], chat: Optional[Any]) -> bool:
+    chat_type = getattr(chat, "type", None)
+    if chat_type == "private":
+        return True
+    return _is_admin(user)
+
+
 def _paginate_jobs(
     page: int,
     page_size: int,
@@ -442,10 +449,14 @@ async def _ensure_reply_menu(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     if data.get(STATE_REPLY_MENU_SHOWN):
         return
+    allow_settings = message.chat.type == "private" or _is_admin(message.from_user)
     await _answer_safe(
         message,
         "👇 Быстрые действия",
-        reply_markup=ui_kb.reply_menu_kb(_is_admin(message.from_user)),
+        reply_markup=ui_kb.reply_menu_kb(
+            _is_admin(message.from_user),
+            allow_settings=allow_settings,
+        ),
     )
     await state.update_data({STATE_REPLY_MENU_SHOWN: True})
 
@@ -714,7 +725,10 @@ async def _show_active(
 
 async def _show_create_hint(message: Message, user: Optional[User]) -> None:
     text = ui_txt.create_reminder_hint(message.chat.id)
-    kb = ui_kb.main_menu_kb(_is_admin(user))
+    kb = ui_kb.main_menu_kb(
+        _is_admin(user),
+        allow_settings=_can_manage_settings(user, message.chat),
+    )
     try:
         await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
     except TelegramBadRequest:
@@ -722,7 +736,7 @@ async def _show_create_hint(message: Message, user: Optional[User]) -> None:
 
 
 async def _show_settings(message: Message, user: Optional[User], state: FSMContext) -> None:
-    if not _is_admin(user):
+    if not _can_manage_settings(user, message.chat):
         await _answer_safe(message, "⛔ Только администратор может менять настройки.")
         return
     await state.update_data({STATE_AWAIT_TZ: False, STATE_AWAIT_ADMIN_ADD: False, STATE_AWAIT_ADMIN_DEL: False})
@@ -868,7 +882,15 @@ def restore_jobs() -> None:
 async def cmd_start(message: Message, state: FSMContext) -> None:
     user = message.from_user
     text = ui_txt.menu_text_for(message.chat.id)
-    await _answer_safe(message, text, parse_mode=ParseMode.MARKDOWN, reply_markup=ui_kb.main_menu_kb(_is_admin(user)))
+    await _answer_safe(
+        message,
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ui_kb.main_menu_kb(
+            _is_admin(user),
+            allow_settings=_can_manage_settings(user, message.chat),
+        ),
+    )
     await _ensure_reply_menu(message, state)
 
 
@@ -876,7 +898,15 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 async def cmd_help(message: Message, state: FSMContext) -> None:
     user = message.from_user
     text = ui_txt.show_help_text()
-    await _answer_safe(message, text, parse_mode=ParseMode.MARKDOWN, reply_markup=ui_kb.main_menu_kb(_is_admin(user)))
+    await _answer_safe(
+        message,
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ui_kb.main_menu_kb(
+            _is_admin(user),
+            allow_settings=_can_manage_settings(user, message.chat),
+        ),
+    )
     await _ensure_reply_menu(message, state)
 
 
@@ -954,7 +984,10 @@ async def handle_private_text(message: Message, state: FSMContext) -> None:
             await _answer_safe(message,
                 menu_text,
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=ui_kb.main_menu_kb(_is_admin(user)),
+                reply_markup=ui_kb.main_menu_kb(
+                    _is_admin(user),
+                    allow_settings=_can_manage_settings(user, message.chat),
+                ),
             )
         elif action == "create":
             await state.update_data({STATE_FORCE_PICK: True})
@@ -967,10 +1000,13 @@ async def handle_private_text(message: Message, state: FSMContext) -> None:
             await _show_settings(message, user, state)
         elif action == "help":
             help_text = ui_txt.show_help_text()
-            await _answer_safe(message, 
+            await _answer_safe(message,
                 help_text,
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=ui_kb.main_menu_kb(_is_admin(user)),
+                reply_markup=ui_kb.main_menu_kb(
+                    _is_admin(user),
+                    allow_settings=_can_manage_settings(user, message.chat),
+                ),
             )
         await _ensure_reply_menu(message, state)
         return
@@ -1057,7 +1093,10 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
 
     if data == constants.CB_MENU:
         text = ui_txt.menu_text_for(message.chat.id)
-        kb = ui_kb.main_menu_kb(_is_admin(user))
+        kb = ui_kb.main_menu_kb(
+            _is_admin(user),
+            allow_settings=_can_manage_settings(user, message.chat),
+        )
         try:
             await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         except TelegramBadRequest:
@@ -1068,7 +1107,10 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
 
     if data == constants.CB_HELP:
         text = ui_txt.show_help_text()
-        kb = ui_kb.main_menu_kb(_is_admin(user))
+        kb = ui_kb.main_menu_kb(
+            _is_admin(user),
+            allow_settings=_can_manage_settings(user, message.chat),
+        )
         try:
             await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         except TelegramBadRequest:
