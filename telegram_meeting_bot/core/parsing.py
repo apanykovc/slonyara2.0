@@ -18,7 +18,7 @@ def _localize(tz, dt: datetime) -> datetime:
 
 
 def parse_meeting_message(text: str, tz) -> Optional[Dict[str, Any]]:
-    """Разобрать строку вида ``ДД.ММ ТИП ЧЧ:ММ ПЕРЕГ НОМЕР``.
+    """Разобрать строку вида ``ДД.ММ ТИП ЧЧ:ММ ПЕРЕГ [НОМЕР]``.
 
     Возвращает словарь с ключами:
     ``dt_local`` (aware ``datetime``), ``date_str``, ``time_str``, ``type``,
@@ -33,7 +33,7 @@ def parse_meeting_message(text: str, tz) -> Optional[Dict[str, Any]]:
     try:
         day = int(day_str)
         month = int(month_str)
-        hour_str, minute_str = time_part.split(":", 1)
+        hour_str, minute_str = time_part.replace(".", ":", 1).split(":", 1)
         hour = int(hour_str)
         minute = int(minute_str)
     except (TypeError, ValueError):
@@ -59,7 +59,14 @@ def parse_meeting_message(text: str, tz) -> Optional[Dict[str, Any]]:
 
     date_str = f"{day:02d}.{month:02d}"
     time_str = f"{hour:02d}:{minute:02d}"
-    canonical = f"{date_str} {meeting_type} {time_str} {room} {ticket}"
+    meeting_type = meeting_type.strip()
+    room = room.strip()
+    ticket = (ticket or "").strip()
+    canonical_parts = [date_str, meeting_type, time_str, room]
+    if ticket:
+        canonical_parts.append(ticket)
+    canonical = " ".join(canonical_parts)
+    ticket_placeholder = f" {ticket}" if ticket else ""
 
     return {
         "dt_local": candidate,
@@ -74,6 +81,6 @@ def parse_meeting_message(text: str, tz) -> Optional[Dict[str, Any]]:
             type=meeting_type,
             time=time_str,
             room=room,
-            ticket=ticket,
+            ticket=ticket_placeholder,
         ),
     }

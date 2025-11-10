@@ -98,12 +98,12 @@ if "AUDIT_LOG_RETENTION_DAYS" not in os.environ and "BOT_LOG_RETENTION_DAYS" in 
 # Окно дедупликации (30 записей ≈ 30 секунд)
 recent_signatures = deque(maxlen=30)
 
-# Шаблон текста напоминания
-REMINDER_TEMPLATE = "{date} {type} {time} {room} {ticket}"
+# Шаблон текста напоминания (номер заявки добавляется с пробелом при наличии)
+REMINDER_TEMPLATE = "{date} {type} {time} {room}{ticket}"
 
-# Регэксп для строки встречи: день, месяц, тип, время, аудитория, номер
+# Регэксп для строки встречи: день, месяц, тип, время, аудитория и опциональный номер
 MEETING_REGEX = re.compile(
-    r"^\s*(\d{1,2})[.\-/](\d{1,2})\s+(\S+)\s+(\d{1,2}:\d{2})\s+(\S+)\s+(\S+)\s*$",
+    r"^\s*(\d{1,2})[.\-/](\d{1,2})\s+(\S+)\s+(\d{1,2}[:.]\d{2})\s+(\S+)(?:\s+(.+?))?\s*$",
     re.IGNORECASE,
 )
 

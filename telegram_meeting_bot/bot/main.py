@@ -814,10 +814,10 @@ def parse_meeting_message(text: str, tz: pytz.BaseTzInfo) -> Optional[Dict[str, 
     m = MEETING_REGEX.match(text or "")
     if not m:
         return None
-    day_str, month_str, mtype, time_str, room, ticket = m.groups()
+    day_str, month_str, mtype, time_str_raw, room, ticket = m.groups()
     try:
         d = int(day_str); mth = int(month_str)
-        hh, mm = time_str.split(":"); hh = int(hh); mm = int(mm)
+        hh, mm = time_str_raw.replace(".", ":", 1).split(":"); hh = int(hh); mm = int(mm)
     except Exception:
         return None
 
@@ -837,6 +837,14 @@ def parse_meeting_message(text: str, tz: pytz.BaseTzInfo) -> Optional[Dict[str, 
 
     date_str = f"{d:02d}.{mth:02d}"
     time_str_norm = f"{hh:02d}:{mm:02d}"
+    mtype = mtype.strip()
+    room = room.strip()
+    ticket = (ticket or "").strip()
+    canonical_parts = [date_str, mtype, time_str_norm, room]
+    if ticket:
+        canonical_parts.append(ticket)
+    canonical_full = " ".join(canonical_parts)
+    ticket_placeholder = f" {ticket}" if ticket else ""
 
     return {
         "dt_local": candidate,
@@ -845,17 +853,21 @@ def parse_meeting_message(text: str, tz: pytz.BaseTzInfo) -> Optional[Dict[str, 
         "type": mtype,
         "room": room,
         "ticket": ticket,
-        "canonical_full": f"{date_str} {mtype} {time_str_norm} {room} {ticket}",
+        "canonical_full": canonical_full,
         "reminder_text": REMINDER_TEMPLATE.format(
-            date=date_str, type=mtype, time=time_str_norm, room=room, ticket=ticket
+            date=date_str,
+            type=mtype,
+            time=time_str_norm,
+            room=room,
+            ticket=ticket_placeholder,
         ),
     }
 
 def explain_format_error(text: str) -> str:
     return (
         "🙈 *Не понял формат встречи.*\n"
-        "Жду: `ДД.ММ ТИП ЧЧ:ММ ПЕРЕГ НОМЕР`\n"
-        "Например: `08.08 МТС 20:40 2в 88634`\n"
+        "Жду: `ДД.ММ ТИП ЧЧ:ММ ПЕРЕГ [НОМЕР]`\n"
+        "Например: `08.08 МТС 20:40 2в 88634` или `08.08 МТС 20:40 2в`\n"
         "Вы прислали: `" + text.replace('`', 'ʼ') + "`"
     )
 
