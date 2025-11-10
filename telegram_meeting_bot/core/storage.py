@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -13,10 +13,12 @@ from .constants import (
     ADMINS_PATH,
     ADMIN_USERNAMES,
     CFG_PATH,
+    DEFAULT_REMINDER_OFFSET_MINUTES,
     JOBS_DB_PATH,
     LEGACY_JOBS_PATH,
     TARGETS_PATH,
 )
+from .parsing import parse_meeting_message
 
 logger = logging.getLogger("reminder-bot")
 
@@ -221,7 +223,38 @@ def resolve_tz_for_chat(chat_id: int) -> pytz.BaseTzInfo:
 
 def get_offset_for_chat(chat_id: int) -> int:
     entry = get_chat_cfg_entry(chat_id)
-    return int(entry.get("offset", 30))
+    raw = entry.get("offset", DEFAULT_REMINDER_OFFSET_MINUTES)
+    try:
+        offset = int(raw)
+    except (TypeError, ValueError):
+        offset = DEFAULT_REMINDER_OFFSET_MINUTES
+    if offset <= 0:
+        offset = DEFAULT_REMINDER_OFFSET_MINUTES
+    return offset
+
+
+def compute_job_times(job: Dict[str, Any]) -> Optional[tuple[datetime, datetime]]:
+    """Вернуть локальные время напоминания и самой встречи из записи job."""
+
+    text = job.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    chat_id_raw = job.get("target_chat_id") or job.get("source_chat_id")
+    try:
+        chat_id = int(str(chat_id_raw))
+    except (TypeError, ValueError):
+        return None
+
+    tz = resolve_tz_for_chat(chat_id)
+    parsed = parse_meeting_message(text, tz)
+    if not parsed:
+        return None
+
+    offset_minutes = get_offset_for_chat(chat_id)
+    meeting_local = parsed["dt_local"]
+    reminder_local = meeting_local - timedelta(minutes=offset_minutes)
+    return reminder_local, meeting_local
 
 
 # Работа со списком известных чатов ----------------------------------------
