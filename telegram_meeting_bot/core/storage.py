@@ -219,9 +219,25 @@ def resolve_tz_for_chat(chat_id: int) -> pytz.BaseTzInfo:
         return pytz.utc
 
 
+def normalize_offset(value: Any, fallback: int | None = 0) -> int:
+    """Convert ``value`` to a non-negative integer offset in minutes."""
+
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        minutes = fallback
+    if minutes is None:
+        minutes = fallback
+    if minutes is None:
+        return 0
+    return max(0, minutes)
+
+
 def get_offset_for_chat(chat_id: int) -> int:
     entry = get_chat_cfg_entry(chat_id)
-    return int(entry.get("offset", 30))
+    if "offset" not in entry:
+        return 30
+    return normalize_offset(entry.get("offset"), fallback=30)
 
 
 # Работа со списком известных чатов ----------------------------------------

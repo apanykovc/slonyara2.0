@@ -345,6 +345,70 @@ def _apply_offset(dt: datetime, minutes: int) -> datetime:
     return dt - timedelta(minutes=minutes)
 
 
+def _extract_chat_id(value: Any) -> Optional[int]:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _sync_job_schedule(job: Dict[str, Any]) -> Optional[datetime]:
+    run_iso = job.get("run_at_utc")
+    if not isinstance(run_iso, str):
+        return None
+    try:
+        run_at = datetime.fromisoformat(run_iso)
+    except Exception:
+        return None
+    if run_at.tzinfo is None:
+        run_at = run_at.replace(tzinfo=timezone.utc)
+
+    cfg_chat_id = _extract_chat_id(job.get("target_chat_id"))
+    if cfg_chat_id is None:
+        cfg_chat_id = _extract_chat_id(job.get("source_chat_id"))
+
+    if cfg_chat_id is None:
+        tz = timezone.utc
+        default_offset = 30
+    else:
+        tz = storage.resolve_tz_for_chat(cfg_chat_id)
+        default_offset = storage.get_offset_for_chat(cfg_chat_id)
+
+    stored_offset = storage.normalize_offset(job.get("offset_minutes"), fallback=None)
+    if stored_offset == 0 and job.get("offset_minutes") is None:
+        offset_minutes = default_offset
+    else:
+        offset_minutes = storage.normalize_offset(stored_offset or job.get("offset_minutes"), fallback=default_offset)
+
+    updates: Dict[str, Any] = {}
+    if job.get("offset_minutes") != offset_minutes:
+        job["offset_minutes"] = offset_minutes
+        updates["offset_minutes"] = offset_minutes
+
+    reminder_local = run_at.astimezone(tz)
+    desired_local = reminder_local
+    text = job.get("text")
+    if isinstance(text, str) and text:
+        parsed = parse_meeting_message(text, tz)
+        if parsed:
+            desired_local = _apply_offset(parsed["dt_local"], offset_minutes)
+
+    if abs((desired_local - reminder_local).total_seconds()) >= 59:
+        run_at = desired_local.astimezone(timezone.utc)
+        job["run_at_utc"] = run_at.isoformat()
+        updates["run_at_utc"] = job["run_at_utc"]
+
+    job_id = job.get("job_id")
+    if updates and isinstance(job_id, str):
+        storage.upsert_job_record(job_id, updates)
+
+    return run_at
+
+
 def _resolve_target_title(target_chat_id: int | str) -> str:
     for known in storage.get_known_chats():
         if str(known.get("chat_id")) == str(target_chat_id):
@@ -498,9 +562,14 @@ async def schedule_reminder(
         await _answer_safe(message, "⚠️ Такая напоминалка уже есть.")
         return
 
-    offset_minutes = storage.get_offset_for_chat(
-        int(target_chat_id) if isinstance(target_chat_id, int) else source_chat_id
-    )
+    cfg_chat_id = _extract_chat_id(target_chat_id)
+    if cfg_chat_id is None:
+        cfg_chat_id = _extract_chat_id(source_chat_id)
+
+    if cfg_chat_id is not None:
+        offset_minutes = storage.get_offset_for_chat(cfg_chat_id)
+    else:
+        offset_minutes = storage.normalize_offset(None, fallback=30)
     reminder_local = _apply_offset(parsed["dt_local"], offset_minutes)
     reminder_utc = reminder_local.astimezone(timezone.utc)
     now_utc = _utc_now()
@@ -519,6 +588,7 @@ async def schedule_reminder(
         "signature": f"{target_chat_id}:{parsed['canonical_full']}",
         "rrule": constants.RR_ONCE,
         "run_at_utc": reminder_utc.isoformat(),
+        "offset_minutes": offset_minutes,
     }
 
     if reminder_utc <= now_utc:
@@ -782,12 +852,8 @@ def restore_jobs() -> None:
         job_id = job.get("job_id")
         if not job_id:
             continue
-        run_iso = job.get("run_at_utc")
-        try:
-            run_at = datetime.fromisoformat(run_iso)
-            if run_at.tzinfo is None:
-                run_at = run_at.replace(tzinfo=timezone.utc)
-        except Exception:
+        run_at = _sync_job_schedule(job)
+        if run_at is None:
             continue
         delay = (run_at - now).total_seconds()
         if delay <= 0 and delay >= -constants.CATCHUP_WINDOW_SECONDS:

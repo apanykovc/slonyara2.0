@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
 from typing import Any, Dict, Iterable
 
@@ -11,6 +11,7 @@ from ..core.storage import (
     get_jobs_store,
     get_known_chats,
     get_offset_for_chat,
+    normalize_offset,
     resolve_tz_for_chat,
 )
 
@@ -128,6 +129,16 @@ def render_active_text(
             dt_utc = None
         target_chat_id = job.get("target_chat_id")
         tz = resolve_tz_for_chat(int(target_chat_id)) if target_chat_id is not None else pytz.utc
+        offset_minutes = normalize_offset(job.get("offset_minutes"), fallback=None)
+        if offset_minutes == 0 and job.get("offset_minutes") is None:
+            try:
+                cfg_id = int(target_chat_id)
+            except (TypeError, ValueError):
+                cfg_id = None
+            if cfg_id is not None:
+                offset_minutes = get_offset_for_chat(cfg_id)
+
+        meeting_local = None
         if dt_utc is not None:
             dt_local = dt_utc.astimezone(tz)
             delta = dt_local - datetime.now(tz)
@@ -135,7 +146,11 @@ def render_active_text(
             suffix = (
                 f"через {minutes} мин" if minutes >= 0 else f"{abs(minutes)} мин назад"
             )
-            when = f"{dt_local:%d.%m %H:%M %Z} ({suffix})"
+            extra = ""
+            if offset_minutes:
+                meeting_local = dt_local + timedelta(minutes=offset_minutes)
+                extra = f"; напоминание за {offset_minutes} мин до встречи"
+            when = f"{dt_local:%d.%m %H:%M %Z} ({suffix}{extra})"
         else:
             when = run_iso or ""
         title = job.get("target_title") or str(target_chat_id)
@@ -146,6 +161,8 @@ def render_active_text(
             f"{index}) <b>{escape(when)}</b>",
             escape(text),
         ]
+        if meeting_local is not None:
+            info_lines.append(f"Встреча: {meeting_local:%d.%m %H:%M %Z}")
         if admin:
             author = job.get("author_username") or job.get("author_id")
             if author:
