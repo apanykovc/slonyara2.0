@@ -776,24 +776,69 @@ async def send_reminder_job(job_id: str | None = None, **_: Any) -> None:
         _remove_job(job_id)
 
 
+def _sync_job_schedule(job: Dict[str, Any]) -> tuple[Optional[datetime], Optional[datetime]]:
+    """Ensure job's run time matches the current offset.
+
+    Returns a pair of aware datetimes (run_at_utc, meeting_at_utc). Either value
+    can be *None* when the information is unavailable.
+    """
+
+    job_id = job.get("job_id")
+    run_at = None
+    meeting_at = None
+    run_iso = job.get("run_at_utc")
+    if isinstance(run_iso, str) and run_iso:
+        try:
+            run_at = datetime.fromisoformat(run_iso)
+            if run_at.tzinfo is None:
+                run_at = run_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            run_at = None
+
+    job_times = storage.compute_job_times(job)
+    if job_times:
+        reminder_local, meeting_local = job_times
+        desired_run = reminder_local.astimezone(timezone.utc)
+        meeting_at = meeting_local.astimezone(timezone.utc)
+        if run_at is None or abs((run_at - desired_run).total_seconds()) > 59:
+            run_at = desired_run
+            job["run_at_utc"] = desired_run.isoformat()
+            if job_id:
+                storage.upsert_job_record(job_id, {"run_at_utc": job["run_at_utc"]})
+            logger.info(
+                "Adjusted reminder %s to %s UTC (meeting at %s UTC)",
+                job_id,
+                job["run_at_utc"],
+                meeting_at.isoformat() if meeting_at else "unknown",
+            )
+
+    return run_at, meeting_at
+
+
 def restore_jobs() -> None:
     now = _utc_now()
     for job in storage.get_jobs_store():
         job_id = job.get("job_id")
         if not job_id:
             continue
-        run_iso = job.get("run_at_utc")
-        try:
-            run_at = datetime.fromisoformat(run_iso)
-            if run_at.tzinfo is None:
-                run_at = run_at.replace(tzinfo=timezone.utc)
-        except Exception:
+
+        run_at, meeting_at = _sync_job_schedule(job)
+        if run_at is None:
             continue
+
         delay = (run_at - now).total_seconds()
-        if delay <= 0 and delay >= -constants.CATCHUP_WINDOW_SECONDS:
-            asyncio.create_task(send_reminder_job(job_id))
-        elif delay > 0:
-            _schedule_job(job_id, run_at)
+        if delay <= 0:
+            should_catch_up = False
+            if meeting_at and meeting_at > now:
+                should_catch_up = True
+            elif delay >= -constants.CATCHUP_WINDOW_SECONDS:
+                should_catch_up = True
+
+            if should_catch_up:
+                asyncio.create_task(send_reminder_job(job_id))
+            continue
+
+        _schedule_job(job_id, run_at)
 
 # === Commands ===
 

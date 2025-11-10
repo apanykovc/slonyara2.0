@@ -83,12 +83,25 @@ from ..core.constants import (
     OWNER_USERNAMES,
 )
 from ..core.storage import (
-    get_cfg, set_cfg, get_chat_cfg_entry, update_chat_cfg,
-    get_jobs_store, set_jobs_store, add_job_record, remove_job_record,
-    get_job_record, upsert_job_record, find_job_by_text,
-    resolve_tz_for_chat, get_offset_for_chat,
-    get_known_chats, register_chat, unregister_chat,
-    add_admin_username, remove_admin_username,
+    get_cfg,
+    set_cfg,
+    get_chat_cfg_entry,
+    update_chat_cfg,
+    get_jobs_store,
+    set_jobs_store,
+    add_job_record,
+    remove_job_record,
+    get_job_record,
+    upsert_job_record,
+    find_job_by_text,
+    resolve_tz_for_chat,
+    get_offset_for_chat,
+    get_known_chats,
+    register_chat,
+    unregister_chat,
+    add_admin_username,
+    remove_admin_username,
+    compute_job_times,
 )
 from ..ui.keyboards import (
     actions_kb,
@@ -2512,19 +2525,61 @@ def restore_jobs(app: Application):
     kept = []
     caught_up = 0
     for r in items:
-        try:
-            run_at = datetime.fromisoformat(r["run_at_utc"])
-        except Exception:
+        job_id = r.get("job_id")
+        if not job_id:
             continue
+
+        run_at = None
+        try:
+            run_at_raw = r.get("run_at_utc")
+            if run_at_raw:
+                run_at = datetime.fromisoformat(run_at_raw)
+        except Exception:
+            run_at = None
+
+        if run_at is not None and run_at.tzinfo is None:
+            run_at = run_at.replace(tzinfo=pytz.utc)
+
+        meeting_at = None
+        job_times = compute_job_times(r)
+        if job_times:
+            reminder_local, meeting_local = job_times
+            desired_run = reminder_local.astimezone(pytz.utc)
+            meeting_at = meeting_local.astimezone(pytz.utc)
+            if run_at is None or abs((run_at - desired_run).total_seconds()) > 59:
+                run_at = desired_run
+                upsert_job_record(job_id, {"run_at_utc": desired_run.isoformat()})
+                r["run_at_utc"] = desired_run.isoformat()
+                audit_log(
+                    "REM_ADJUSTED",
+                    reminder_id=job_id,
+                    chat_id=r.get("target_chat_id"),
+                    topic_id=r.get("topic_id"),
+                    title=r.get("text"),
+                    new_run_at=desired_run.isoformat(),
+                )
+
+        if run_at is None:
+            continue
+
+        if run_at.tzinfo is None:
+            run_at = run_at.replace(tzinfo=pytz.utc)
+
         delay = (run_at - now_utc).total_seconds()
         if delay <= 0:
-            if delay >= -CATCHUP_WINDOW_SECONDS:
+            should_catch_up = False
+            if meeting_at and meeting_at > now_utc:
+                should_catch_up = True
+            elif delay >= -CATCHUP_WINDOW_SECONDS:
+                should_catch_up = True
+
+            if should_catch_up:
                 app.job_queue.run_once(
                     send_reminder,
                     when=1,
-                    name=r["job_id"],
+                    name=job_id,
                     data={
-                        "job_id": r["job_id"],
+                        "job_id": job_id,
                         "target_chat_id": r["target_chat_id"],
                         "topic_id": r.get("topic_id"),
                         "text": r["text"],
@@ -2534,12 +2589,13 @@ def restore_jobs(app: Application):
                 )
                 caught_up += 1
             continue
+
         app.job_queue.run_once(
             send_reminder,
             when=delay,
-            name=r["job_id"],
+            name=job_id,
             data={
-                "job_id": r["job_id"],
+                "job_id": job_id,
                 "target_chat_id": r["target_chat_id"],
                 "topic_id": r.get("topic_id"),
                 "text": r["text"],
