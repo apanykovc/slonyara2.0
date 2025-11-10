@@ -45,7 +45,11 @@ from ..core.constants import (
 )
 
 
-def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
+def main_menu_kb(
+    is_admin: bool = False,
+    *,
+    allow_settings: bool = False,
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="🆕 Создать встречу", callback_data=CB_CREATE)],
         [InlineKeyboardButton(text="📂 Мои встречи", callback_data=CB_MY)],
@@ -53,11 +57,17 @@ def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
     if is_admin:
         rows[-1].append(InlineKeyboardButton(text="📝 Активные", callback_data=CB_ACTIVE))
         rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data=CB_SETTINGS)])
+    elif allow_settings:
+        rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data=CB_SETTINGS)])
     rows.append([InlineKeyboardButton(text="❓ Справка", callback_data=CB_HELP)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def reply_menu_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
+def reply_menu_kb(
+    is_admin: bool = False,
+    *,
+    allow_settings: bool = False,
+) -> ReplyKeyboardMarkup:
     """Отдельная клавиатура под строкой ввода с ключевыми действиями."""
 
     rows: list[list[KeyboardButton]] = [
@@ -73,6 +83,8 @@ def reply_menu_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
                 KeyboardButton(text="⚙️ Настройки"),
             ]
         )
+    elif allow_settings:
+        rows.append([KeyboardButton(text="⚙️ Настройки")])
     rows.append([KeyboardButton(text="❓ Справка")])
     return ReplyKeyboardMarkup(
         keyboard=rows,

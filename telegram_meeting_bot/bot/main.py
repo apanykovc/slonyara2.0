@@ -632,6 +632,15 @@ def is_admin(user: Optional[User]) -> bool:
     return bool(username and username.lower() in ADMIN_USERNAMES)
 
 
+def can_manage_settings(user: Optional[User], chat: Optional[Any]) -> bool:
+    """Определить, может ли пользователь менять настройки в конкретном чате."""
+
+    chat_type = getattr(chat, "type", None)
+    if chat_type == "private":
+        return True
+    return is_admin(user)
+
+
 async def _auto_delete(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Удалить сообщение по расписанию."""
     data = ctx.job.data or {}
@@ -777,7 +786,7 @@ async def _send_active_overview_message(
         note = await reply_text_safe(
             message,
             "Пока нет активных напоминаний.",
-            reply_markup=main_menu_kb(admin),
+            reply_markup=_main_menu_keyboard(user, message.chat),
         )
         auto_delete(note, context)
         return
@@ -785,10 +794,14 @@ async def _send_active_overview_message(
     await reply_text_safe(message, text_out, reply_markup=markup, parse_mode="HTML")
 
 
-def _make_reply_menu_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
+def _make_reply_menu_keyboard(
+    is_admin: bool = False,
+    *,
+    allow_settings: bool = False,
+) -> ReplyKeyboardMarkup:
     """Преобразовать aiogram-клавиатуру в формат python-telegram-bot."""
 
-    source = reply_menu_kb(is_admin)
+    source = reply_menu_kb(is_admin, allow_settings=allow_settings)
     rows: list[list[str]] = []
     resize = True
     one_time = False
@@ -802,10 +815,26 @@ def _make_reply_menu_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
     if not rows:
         if is_admin:
             rows = [["📝 Активные", "❓ Справка"]]
+        elif allow_settings:
+            rows = [["⚙️ Настройки"], ["❓ Справка"]]
         else:
             rows = [["📂 Мои встречи", "❓ Справка"]]
 
     return ReplyKeyboardMarkup(rows, resize_keyboard=resize, one_time_keyboard=one_time)
+
+
+def _main_menu_keyboard(user: Optional[User], chat: Optional[Any]) -> InlineKeyboardMarkup:
+    return main_menu_kb(
+        is_admin(user),
+        allow_settings=can_manage_settings(user, chat),
+    )
+
+
+def _reply_menu_keyboard(user: Optional[User], chat: Optional[Any]) -> ReplyKeyboardMarkup:
+    return _make_reply_menu_keyboard(
+        is_admin(user),
+        allow_settings=can_manage_settings(user, chat),
+    )
 
 # ==========================
 # ----- ПАРСЕР И ОШИБКИ -----
@@ -1370,10 +1399,12 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
     q = update.callback_query
     if not q or not q.data:
         return
-    chat_id = q.message.chat.id
+    chat = q.message.chat
+    chat_id = chat.id
     user = q.from_user
     uid = user.id
     admin = is_admin(user)
+    can_manage = can_manage_settings(user, chat)
     data = q.data
 
     await _cancel_previous_action(q.message, context)
@@ -1411,13 +1442,23 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
     if data == CB_MENU:
         text = menu_text_for(chat_id)
         try:
-            await edit_text_safe(q.edit_message_text, text, reply_markup=main_menu_kb(is_admin(user)), parse_mode="Markdown")
+            await edit_text_safe(
+                q.edit_message_text,
+                text,
+                reply_markup=_main_menu_keyboard(user, chat),
+                parse_mode="Markdown",
+            )
         except Exception:
-            await reply_text_safe(q.message, text, reply_markup=main_menu_kb(is_admin(user)), parse_mode="Markdown")
+            await reply_text_safe(
+                q.message,
+                text,
+                reply_markup=_main_menu_keyboard(user, chat),
+                parse_mode="Markdown",
+            )
         return
 
     if data == CB_SETTINGS:
-        if not is_admin(user):
+        if not can_manage:
             msg = await reply_text_safe(q.message, "⛔ Только администратор может менять настройки.")
             auto_delete(msg, context)
             return
@@ -1509,7 +1550,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             msg = await reply_text_safe(
                 q.message,
                 "Пока нет активных напоминаний.",
-                reply_markup=main_menu_kb(admin),
+                reply_markup=_main_menu_keyboard(user, chat),
             )
             auto_delete(msg, context)
             return
@@ -1533,23 +1574,31 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
     if data == CB_HELP:
         text = show_help_text(update)
         try:
-            await edit_text_safe(q.edit_message_text, 
-                text, reply_markup=main_menu_kb(is_admin(user)), parse_mode="Markdown"
+            await edit_text_safe(
+                q.edit_message_text,
+                text,
+                reply_markup=_main_menu_keyboard(user, chat),
+                parse_mode="Markdown",
             )
         except Exception:
             try:
-                await reply_text_safe(q.message, 
-                    text, reply_markup=main_menu_kb(is_admin(user)), parse_mode="Markdown"
+                await reply_text_safe(
+                    q.message,
+                    text,
+                    reply_markup=_main_menu_keyboard(user, chat),
+                    parse_mode="Markdown",
                 )
             except Exception:
-                await reply_text_safe(q.message, 
-                    text, reply_markup=main_menu_kb(is_admin(user))
+                await reply_text_safe(
+                    q.message,
+                    text,
+                    reply_markup=_main_menu_keyboard(user, chat),
                 )
         return
 
     # ---- TZ (таймзона) ----
     if data == CB_SET_TZ:
-        if not is_admin(user):
+        if not can_manage:
             msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
             auto_delete(msg, context)
             return
@@ -1562,7 +1611,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == CB_SET_TZ_LOCAL:
-        if not is_admin(user):
+        if not can_manage:
             msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
             auto_delete(msg, context)
             return
@@ -1573,7 +1622,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == CB_SET_TZ_MOSCOW:
-        if not is_admin(user):
+        if not can_manage:
             msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
             auto_delete(msg, context)
             return
@@ -1584,7 +1633,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == CB_SET_TZ_CHICAGO:
-        if not is_admin(user):
+        if not can_manage:
             msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
             auto_delete(msg, context)
             return
@@ -1595,7 +1644,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == CB_SET_TZ_ENTER:
-        if not is_admin(user):
+        if not can_manage:
             msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
             auto_delete(msg, context)
             return
@@ -1609,7 +1658,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == CB_SET_OFFSET:
-        if not is_admin(user):
+        if not can_manage:
             msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
             auto_delete(msg, context)
             return
@@ -1622,7 +1671,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == CB_OFF_DEC:
-        if not is_admin(user):
+        if not can_manage:
             msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
             auto_delete(msg, context)
             return
@@ -1633,7 +1682,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == CB_OFF_INC:
-        if not is_admin(user):
+        if not can_manage:
             msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
             auto_delete(msg, context)
             return
@@ -1644,7 +1693,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data in (CB_OFF_PRESET_10, CB_OFF_PRESET_15, CB_OFF_PRESET_20, CB_OFF_PRESET_30):
-        if not is_admin(user):
+        if not can_manage:
             msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
             auto_delete(msg, context)
             return
@@ -2099,6 +2148,9 @@ async def schedule_reminder_core(
     offset = get_offset_for_chat(cfg_chat_id)
     tgt_chat = cfg_chat_id
     topic_id = topic_override
+    chat_context = update.effective_chat if update else None
+    menu_markup = _main_menu_keyboard(user, chat_context)
+    admin = is_admin(user)
 
     target_title = next(
         (
@@ -2124,9 +2176,9 @@ async def schedule_reminder_core(
 
     # Проверка на дубликат по тексту
     if find_job_by_text(reminder_text):
-        await reply_text_safe(update.effective_message, 
+        await reply_text_safe(update.effective_message,
             "⚠️ Такая напоминалка уже есть.",
-            reply_markup=main_menu_kb(is_admin(user)),
+            reply_markup=menu_markup,
             parse_mode="Markdown",
         )
         return
@@ -2167,7 +2219,7 @@ async def schedule_reminder_core(
                 f"✅ Напоминание уже должно было быть — отправил сразу в "
                 f"{'этот чат' if tgt_chat == cfg_chat_id else 'выбранный чат'}.\n"
                 f"{canonical_full}",
-                reply_markup=main_menu_kb(is_admin(user)),
+                reply_markup=menu_markup,
                 parse_mode="Markdown",
                 fast_retry=False,
             )
@@ -2242,7 +2294,7 @@ async def schedule_reminder_core(
         delay_sec=round(delay_seconds, 1),
     )
 
-    kb = job_kb(job_id, RR_ONCE) if is_admin(user) else None
+    kb = job_kb(job_id, RR_ONCE) if admin else None
     confirm = await reply_text_safe(update.effective_message,
         f"📌 *Запланировано для* *{target_title}* на *{reminder_dt_local.strftime('%d.%m %H:%M')}* (TZ: {tz.zone})\n"
         f"{canonical_full}\n"
@@ -2264,17 +2316,21 @@ async def schedule_reminder_core(
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _set_log_user(update)
     user = update.effective_user
-    text = menu_text_for(update.effective_chat.id)
-    admin = is_admin(user)
-    await reply_text_safe(update.message,
-        text, reply_markup=main_menu_kb(admin), parse_mode="Markdown"
+    chat = update.effective_chat
+    text = menu_text_for(chat.id)
+    menu_markup = _main_menu_keyboard(user, chat)
+    await reply_text_safe(
+        update.message,
+        text,
+        reply_markup=menu_markup,
+        parse_mode="Markdown",
     )
-    if update.effective_chat.type == "private":
+    if chat.type == "private":
         await safe_send_message(
             context,
-            chat_id=update.effective_chat.id,
+            chat_id=chat.id,
             text="⌨️ Быстрые кнопки доступны под строкой ввода.",
-            reply_markup=_make_reply_menu_keyboard(admin),
+            reply_markup=_reply_menu_keyboard(user, chat),
             fast_retry=False,
         )
 
@@ -2282,13 +2338,20 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _set_log_user(update)
     user = update.effective_user
     text = show_help_text(update)
+    chat = update.effective_chat
+    menu_markup = _main_menu_keyboard(user, chat)
     try:
-        await reply_text_safe(update.message, 
-            text, reply_markup=main_menu_kb(is_admin(user)), parse_mode="Markdown"
+        await reply_text_safe(
+            update.message,
+            text,
+            reply_markup=menu_markup,
+            parse_mode="Markdown",
         )
     except Exception:
-        await reply_text_safe(update.message, 
-            text, reply_markup=main_menu_kb(is_admin(user))
+        await reply_text_safe(
+            update.message,
+            text,
+            reply_markup=menu_markup,
         )
 
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2373,6 +2436,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = chat.id
     user = update.effective_user
     uid = user.id
+    menu_markup = _main_menu_keyboard(user, chat)
 
     normalized = text_in.lower()
     quick_actions = {
@@ -2405,7 +2469,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_text_safe(
             update.message,
             hint,
-            reply_markup=main_menu_kb(is_admin(user)),
+            reply_markup=menu_markup,
             parse_mode="Markdown",
         )
         return
