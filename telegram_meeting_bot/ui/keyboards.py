@@ -14,6 +14,10 @@ from ..core.constants import (
     CB_ADMIN_ADD,
     CB_ADMIN_DEL,
     CB_ADMINS,
+    CB_ARCHIVE,
+    CB_ARCHIVE_CLEAR,
+    CB_ARCHIVE_CLEAR_CONFIRM,
+    CB_ARCHIVE_PAGE,
     CB_CANCEL,
     CB_CHAT_DEL,
     CB_CHATS,
@@ -99,6 +103,7 @@ def settings_menu_kb(is_owner: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🕒 Таймзона", callback_data=CB_SET_TZ)],
         [InlineKeyboardButton(text="⏳ Оффсет (мин)", callback_data=CB_SET_OFFSET)],
         [InlineKeyboardButton(text="📋 Чаты", callback_data=CB_CHATS)],
+        [InlineKeyboardButton(text="📦 Архив", callback_data=CB_ARCHIVE)],
     ]
     if is_owner:
         rows.append([InlineKeyboardButton(text="👥 Админы", callback_data=CB_ADMINS)])
@@ -231,6 +236,38 @@ def active_kb(
     else:
         rows.append([InlineKeyboardButton(text="⟲ Обновить", callback_data=f"{page_prefix}:{page}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def archive_kb(
+    page: int,
+    pages_total: int,
+    *,
+    has_entries: bool,
+    can_clear: bool,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    nav: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"{CB_ARCHIVE_PAGE}:{page-1}"))
+    if page < pages_total:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"{CB_ARCHIVE_PAGE}:{page+1}"))
+    if nav:
+        rows.append(nav)
+    else:
+        rows.append([InlineKeyboardButton(text="⟲ Обновить", callback_data=f"{CB_ARCHIVE_PAGE}:{page}")])
+    if can_clear and has_entries:
+        rows.append([InlineKeyboardButton(text="🧹 Очистить", callback_data=CB_ARCHIVE_CLEAR)])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_SETTINGS)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def archive_clear_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, очистить", callback_data=CB_ARCHIVE_CLEAR_CONFIRM)],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_ARCHIVE)],
+        ]
+    )
 
 
 def actions_kb(

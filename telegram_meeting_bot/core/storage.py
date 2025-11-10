@@ -112,6 +112,16 @@ def migrate_legacy_json(
     conn.execute(
         "CREATE TABLE IF NOT EXISTS reminders (job_id TEXT PRIMARY KEY, data TEXT NOT NULL)"
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS archived_reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT,
+            archived_at TEXT NOT NULL,
+            data TEXT NOT NULL
+        )
+        """
+    )
     count = 0
     with conn:
         for rec in data:
@@ -198,6 +208,131 @@ def find_job_by_text(text: str) -> Optional[Dict[str, Any]]:
             (text,),
         ).fetchone()
     return json.loads(row["data"]) if row else None
+
+
+def archive_job(
+    job_id: str,
+    rec: Optional[Dict[str, Any]] = None,
+    *,
+    reason: str,
+    removed_by: Optional[Dict[str, Any]] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Перенести напоминание в архив и удалить из активных."""
+
+    if not job_id:
+        return False
+
+    record = dict(rec or {}) if rec else None
+    if record is None:
+        record = get_job_record(job_id)
+    if not record:
+        return False
+
+    payload = dict(record)
+    payload.setdefault("job_id", job_id)
+    payload["archive_reason"] = reason
+    payload["archived_at_utc"] = datetime.utcnow().replace(microsecond=0).isoformat()
+    if removed_by:
+        payload["removed_by"] = removed_by
+    if extra:
+        payload.update(extra)
+
+    with _connect() as conn, conn:
+        conn.execute(
+            "INSERT INTO archived_reminders (job_id, archived_at, data) VALUES (?, ?, ?)",
+            (
+                payload.get("job_id"),
+                payload["archived_at_utc"],
+                json.dumps(payload, ensure_ascii=False),
+            ),
+        )
+        conn.execute("DELETE FROM reminders WHERE job_id = ?", (job_id,))
+    return True
+
+
+def get_jobs_for_chat(
+    chat_id: Union[int, str],
+    topic_id: Optional[int] = None,
+) -> list[Dict[str, Any]]:
+    """Получить список напоминаний, связанных с указанным чатом/темой."""
+
+    chat_key = str(chat_id)
+    topic_key = None if topic_id is None else int(topic_id)
+    result: list[Dict[str, Any]] = []
+    for rec in get_jobs_store():
+        target_chat = rec.get("target_chat_id")
+        if str(target_chat) != chat_key:
+            continue
+        if topic_key is not None:
+            rec_topic = rec.get("topic_id") or 0
+            try:
+                rec_topic_val = int(rec_topic)
+            except (TypeError, ValueError):
+                rec_topic_val = 0
+            if rec_topic_val != topic_key:
+                continue
+        result.append(rec)
+    return result
+
+
+def archive_jobs_for_chat(
+    chat_id: Union[int, str],
+    topic_id: Optional[int] = None,
+    *,
+    reason: str,
+    removed_by: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Архивировать все напоминания, связанные с указанным чатом."""
+
+    jobs = get_jobs_for_chat(chat_id, topic_id)
+    count = 0
+    for rec in jobs:
+        job_id = rec.get("job_id")
+        if not job_id:
+            continue
+        if archive_job(job_id, rec=rec, reason=reason, removed_by=removed_by):
+            count += 1
+    return count
+
+
+def get_archive_page(
+    page: int,
+    page_size: int,
+) -> tuple[list[Dict[str, Any]], int, int, int]:
+    """Вернуть страницу архива и метаданные (items, total, page, pages_total)."""
+
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+
+    with _connect() as conn:
+        total_row = conn.execute("SELECT COUNT(*) AS c FROM archived_reminders").fetchone()
+        total = int(total_row["c"] if total_row else 0)
+        if total == 0:
+            return [], 0, 1, 1
+        pages_total = max(1, (total + page_size - 1) // page_size)
+        page = min(max(page, 1), pages_total)
+        offset = (page - 1) * page_size
+        rows = conn.execute(
+            """
+            SELECT data FROM archived_reminders
+            ORDER BY datetime(archived_at) DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (page_size, offset),
+        ).fetchall()
+    items = [json.loads(row["data"]) for row in rows]
+    return items, total, page, pages_total
+
+
+def clear_archive() -> int:
+    """Удалить все записи архива. Возвращает количество удалённых элементов."""
+
+    with _connect() as conn, conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM archived_reminders").fetchone()
+        total = int(row["c"] if row else 0)
+        conn.execute("DELETE FROM archived_reminders")
+    return total
 
 
 def upsert_job_record(job_id: str, updates: Dict[str, Any]) -> None:
