@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, Sequence
 import pytz
 
 from ..core.constants import PAGE_SIZE, RR_DAILY, RR_ONCE, RR_WEEKLY, VERSION
+from ..core.logs import LogFileInfo, LogFileView
 from ..core.storage import (
     get_jobs_store,
     get_known_chats,
@@ -22,6 +23,7 @@ from ..core import logs as log_utils
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 APP_LOG_RE = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?P<rest>.*)$")
 APP_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+LOG_BODY_CHAR_LIMIT = 3500
 
 
 def _parse_utc_naive(timestamp: str) -> datetime | None:
@@ -70,13 +72,41 @@ def _format_json_log(line: str) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _format_log_line(log_type: str, line: str) -> str:
+def _format_log_entry(log_type: str, entry: Sequence[str]) -> list[str]:
+    if not entry:
+        return []
     key = log_type.lower()
+    head = entry[0]
     if key == log_utils.LOG_TYPE_APP:
-        return _format_app_log(line)
-    if key in {log_utils.LOG_TYPE_AUDIT, log_utils.LOG_TYPE_ERROR}:
-        return _format_json_log(line)
-    return line
+        head = _format_app_log(head)
+    elif key in {log_utils.LOG_TYPE_AUDIT, log_utils.LOG_TYPE_ERROR}:
+        head = _format_json_log(head)
+    return [head, *entry[1:]]
+
+
+def _format_size(value: int) -> str:
+    units = ["Б", "КБ", "МБ", "ГБ"]
+    size = float(max(value, 0))
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            if unit == "Б":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} ГБ"
+
+
+def _trim_entries_for_display(entries: Sequence[str], limit: int) -> tuple[list[str], bool]:
+    selected = list(entries)
+    truncated = False
+    if not selected:
+        return selected, truncated
+    total_length = sum(len(item) for item in selected) + max(len(selected) - 1, 0) * 2
+    while selected and total_length > limit:
+        selected.pop(0)
+        truncated = True
+        total_length = sum(len(item) for item in selected) + max(len(selected) - 1, 0) * 2
+    return selected, truncated
 
 
 def escape_md(text: str) -> str:
@@ -239,7 +269,7 @@ def render_active_text(
     return "\n".join(lines)
 
 
-def render_logs_preview(log_type: str, entries: Sequence[str], limit: int) -> str:
+def render_log_file_list(log_type: str, files: Sequence[LogFileInfo]) -> str:
     labels = {
         log_utils.LOG_TYPE_APP: "📗 <b>App</b>",
         log_utils.LOG_TYPE_AUDIT: "🧾 <b>Audit</b>",
@@ -252,19 +282,72 @@ def render_logs_preview(log_type: str, entries: Sequence[str], limit: int) -> st
     }
     kind = log_type.lower()
     title = labels.get(kind, f"📜 <b>{escape(kind.title())}</b>")
-    header_lines = [f"{title} — последние {limit} записей"]
+    header_lines = [f"{title} — файлы журнала"]
     description = descriptions.get(kind)
     if description:
         header_lines.append(f"<i>{escape(description)}</i>")
     header = "\n".join(header_lines)
-    if not entries:
-        body = "<i>Пока записей нет.</i>"
+    if not files:
+        body = "<i>Файлы не найдены.</i>"
     else:
-        formatted = [_format_log_line(kind, line) for line in entries[-limit:]]
-        snippet = "\n".join(escape(line) for line in formatted)
-        body = f"<pre>{snippet}</pre>"
-    hint = "Откройте другие разделы или скачайте архив, чтобы посмотреть полную историю."
+        lines = []
+        for info in files:
+            label = info.label or info.name
+            size_text = _format_size(info.size_bytes)
+            if info.modified_at:
+                modified = info.modified_at.astimezone(MOSCOW_TZ)
+                meta = f"{modified:%d.%m %H:%M %Z}, {size_text}"
+            else:
+                meta = size_text
+            lines.append(f"• <code>{escape(label)}</code> — {escape(meta)}")
+        body = "\n".join(lines)
+    hint = "Выберите файл, чтобы посмотреть записи, или скачайте архив для полной истории."
     return f"{header}\n\n{body}\n\n<i>{escape(hint)}</i>"
+
+
+def render_log_file(log_type: str, info: LogFileInfo, view: LogFileView) -> str:
+    labels = {
+        log_utils.LOG_TYPE_APP: "📗 <b>App</b>",
+        log_utils.LOG_TYPE_AUDIT: "🧾 <b>Audit</b>",
+        log_utils.LOG_TYPE_ERROR: "❌ <b>Error</b>",
+    }
+    kind = log_type.lower()
+    title = labels.get(kind, f"📜 <b>{escape(kind.title())}</b>")
+    file_label = info.label or info.name
+    header_lines = [f"{title} — файл <code>{escape(file_label)}</code>"]
+    meta_parts: list[str] = []
+    if info.modified_at:
+        modified = info.modified_at.astimezone(MOSCOW_TZ)
+        meta_parts.append(f"Обновлён {modified:%d.%m %H:%M %Z}")
+    meta_parts.append(f"Размер {_format_size(info.size_bytes)}")
+    if view.total:
+        meta_parts.append(f"Записей: {view.total}")
+    if meta_parts:
+        header_lines.append(f"<i>{escape('; '.join(meta_parts))}</i>")
+    header = "\n".join(header_lines)
+    if not view.entries:
+        body = "<i>Файл пуст.</i>"
+        shown = 0
+        truncated = False
+    else:
+        formatted_entries = [
+            "\n".join(escape(line) for line in _format_log_entry(kind, entry))
+            for entry in view.entries
+        ]
+        display_entries, cut = _trim_entries_for_display(formatted_entries, LOG_BODY_CHAR_LIMIT)
+        truncated = cut or view.truncated
+        shown = len(display_entries)
+        snippet = "\n\n".join(display_entries)
+        body = f"<pre>{snippet}</pre>"
+    footer_lines: list[str] = []
+    if truncated and view.total:
+        footer_lines.append(
+            f"Показаны последние {shown} из {view.total} записей. Полный файл можно скачать из архива."
+        )
+    else:
+        footer_lines.append("Записи отображаются блоками так, как они были сохранены в логе.")
+    footer = "\n".join(escape(line) for line in footer_lines)
+    return f"{header}\n\n{body}\n\n<i>{footer}</i>"
 
 
 def render_archive_text(

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import logging
+import re
 import tempfile
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, List, Tuple
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -22,6 +25,32 @@ _LOG_SOURCES: dict[str, Tuple[Path, str]] = {
 }
 
 _PREVIEW_LIMIT_DEFAULT = 12
+_APP_ENTRY_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\b")
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+@dataclass(frozen=True)
+class LogFileInfo:
+    """Metadata about a stored log file."""
+
+    log_type: str
+    path: Path
+    label: str
+    size_bytes: int
+    modified_at: datetime | None
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+
+@dataclass(frozen=True)
+class LogFileView:
+    """Result of reading log entries from a file."""
+
+    entries: List[List[str]]
+    total: int
+    truncated: bool
 
 
 class ErrorBurstHandler(logging.Handler):
@@ -101,6 +130,48 @@ def iter_log_files(log_type: str | None = None) -> Iterator[Tuple[str, Path]]:
                 yield kind, path
 
 
+def list_log_files(log_type: str) -> List[LogFileInfo]:
+    """Return metadata for available files of the given log type."""
+
+    kind = log_type.lower()
+    if kind not in _LOG_SOURCES:
+        raise ValueError(f"Unknown log type: {log_type}")
+    directory, prefix = _LOG_SOURCES[kind]
+    try:
+        paths = list(directory.glob(f"{prefix}_*.log"))
+    except FileNotFoundError:
+        return []
+
+    infos: List[LogFileInfo] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            size = 0
+            modified = None
+        else:
+            size = stat.st_size
+            modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        label = path.name
+        suffix = ".log"
+        prefix_token = f"{prefix}_"
+        if label.startswith(prefix_token) and label.endswith(suffix):
+            label = label[len(prefix_token) : -len(suffix)]
+        infos.append(
+            LogFileInfo(
+                log_type=kind,
+                path=path,
+                label=label,
+                size_bytes=size,
+                modified_at=modified,
+            )
+        )
+    infos.sort(key=lambda info: (info.modified_at or _EPOCH, info.name), reverse=True)
+    return infos
+
+
 def get_recent_entries(log_type: str, limit: int = _PREVIEW_LIMIT_DEFAULT) -> List[str]:
     """Return last ``limit`` log lines for the specified log type."""
 
@@ -122,6 +193,109 @@ def get_recent_entries(log_type: str, limit: int = _PREVIEW_LIMIT_DEFAULT) -> Li
         except OSError:
             continue
     return list(lines)
+
+
+def get_log_file_info(log_type: str, file_name: str) -> LogFileInfo:
+    """Return metadata for a specific log file name."""
+
+    kind = log_type.lower()
+    if kind not in _LOG_SOURCES:
+        raise ValueError(f"Unknown log type: {log_type}")
+    directory, _ = _LOG_SOURCES[kind]
+    path = (directory / file_name).resolve()
+    try:
+        directory_resolved = directory.resolve()
+    except FileNotFoundError:
+        directory_resolved = directory
+    if path.parent != directory_resolved:
+        raise FileNotFoundError(file_name)
+    if not path.is_file():
+        raise FileNotFoundError(file_name)
+
+    try:
+        stat = path.stat()
+    except OSError:
+        size = 0
+        modified = None
+    else:
+        size = stat.st_size
+        modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+
+    label = file_name
+    suffix = ".log"
+    prefix = f"{_LOG_SOURCES[kind][1]}_"
+    if label.startswith(prefix) and label.endswith(suffix):
+        label = label[len(prefix) : -len(suffix)]
+
+    return LogFileInfo(
+        log_type=kind,
+        path=path,
+        label=label,
+        size_bytes=size,
+        modified_at=modified,
+    )
+
+
+def read_log_entries(
+    log_type: str,
+    path: Path,
+    *,
+    limit: int | None = None,
+) -> LogFileView:
+    """Read entries from a log file grouped by record boundaries."""
+
+    kind = log_type.lower()
+    if kind not in _LOG_SOURCES:
+        raise ValueError(f"Unknown log type: {log_type}")
+    entries_container: deque[List[str]] | List[List[str]]
+    if limit is not None:
+        entries_container = deque(maxlen=max(1, limit))
+    else:
+        entries_container = []
+    total = 0
+
+    def _append(entry: List[str]) -> None:
+        if isinstance(entries_container, deque):
+            entries_container.append(entry)
+        else:
+            entries_container.append(entry)
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            if kind == LOG_TYPE_APP:
+                current: List[str] = []
+                for raw in fh:
+                    line = raw.rstrip("\n")
+                    if _APP_ENTRY_RE.match(line):
+                        if current:
+                            _append(current)
+                            total += 1
+                        current = [line]
+                    else:
+                        if current:
+                            current.append(line)
+                        elif line:
+                            current = [line]
+                if current:
+                    _append(current)
+                    total += 1
+            else:
+                for raw in fh:
+                    line = raw.rstrip("\n")
+                    if not line:
+                        continue
+                    _append([line])
+                    total += 1
+    except FileNotFoundError:
+        return LogFileView(entries=[], total=0, truncated=False)
+
+    if isinstance(entries_container, deque):
+        entries_list = list(entries_container)
+        truncated = total > len(entries_list)
+    else:
+        entries_list = list(entries_container)
+        truncated = False
+    return LogFileView(entries=entries_list, total=total, truncated=truncated)
 
 
 def build_logs_archive() -> Path:

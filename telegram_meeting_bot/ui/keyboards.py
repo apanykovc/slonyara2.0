@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-from aiogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-)
+from typing import Sequence
+
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 from ..core.constants import (
     CB_ACTIONS,
@@ -33,6 +30,7 @@ from ..core.constants import (
     CB_LOGS_CLEAR_CONFIRM,
     CB_LOGS_DOWNLOAD,
     CB_LOGS_ERROR,
+    CB_LOGS_FILE,
     CB_OFF_DEC,
     CB_OFF_INC,
     CB_OFF_PRESET_10,
@@ -54,6 +52,27 @@ from ..core.constants import (
     RR_ONCE,
     RR_WEEKLY,
 )
+from ..core import logs as log_utils
+from ..core.logs import LogFileInfo
+
+
+def _format_size(value: int) -> str:
+    units = ["Б", "КБ", "МБ", "ГБ"]
+    size = float(max(value, 0))
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            if unit == "Б":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} ГБ"
+
+
+_LOG_TYPE_TO_CALLBACK = {
+    log_utils.LOG_TYPE_APP: CB_LOGS_APP,
+    log_utils.LOG_TYPE_AUDIT: CB_LOGS_AUDIT,
+    log_utils.LOG_TYPE_ERROR: CB_LOGS_ERROR,
+}
 
 
 def main_menu_kb(
@@ -180,6 +199,35 @@ def logs_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📥 Скачать все", callback_data=CB_LOGS_DOWNLOAD)],
             [InlineKeyboardButton(text="🧹 Очистить", callback_data=CB_LOGS_CLEAR)],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_SETTINGS)],
+        ]
+    )
+
+
+def log_files_kb(log_type: str, files: Sequence[LogFileInfo]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    kind = log_type.lower()
+    for info in files:
+        label = info.label or info.name
+        size_label = _format_size(info.size_bytes)
+        text = f"{label} • {size_label}"
+        callback = f"{CB_LOGS_FILE}:{kind}:{info.name}"
+        rows.append([InlineKeyboardButton(text=text, callback_data=callback)])
+    rows.append([InlineKeyboardButton(text="📥 Скачать все", callback_data=CB_LOGS_DOWNLOAD)])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_LOGS)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def log_file_view_kb(log_type: str) -> InlineKeyboardMarkup:
+    kind = log_type.lower()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⬅️ К файлам",
+                    callback_data=_LOG_TYPE_TO_CALLBACK.get(kind, CB_LOGS),
+                )
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_LOGS)],
         ]
     )
 

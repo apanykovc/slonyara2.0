@@ -136,6 +136,7 @@ CB_LOGS = "logs"
 CB_LOGS_APP = "logs_app"
 CB_LOGS_AUDIT = "logs_audit"
 CB_LOGS_ERROR = "logs_error"
+CB_LOGS_FILE = "logs_file"  # logs_file:<type>:<filename>
 CB_LOGS_DOWNLOAD = "logs_dl"
 CB_LOGS_CLEAR = "logs_clear"
 CB_LOGS_CLEAR_CONFIRM = "logs_clear_yes"
