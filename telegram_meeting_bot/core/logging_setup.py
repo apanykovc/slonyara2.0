@@ -19,6 +19,7 @@ from .constants import (
     LOGS_AUDIT_DIR,
     LOGS_ERROR_DIR,
 )
+from .logs import ERROR_BURST_MONITOR
 
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 RUN_ID = uuid.uuid4().hex
@@ -261,6 +262,9 @@ def setup_logging(level: str | int | None = None) -> logging.Logger:
     error_handler.setFormatter(ErrorJSONFormatter())
     root_logger.addHandler(error_handler)
 
+    ERROR_BURST_MONITOR.reset()
+    root_logger.addHandler(ERROR_BURST_MONITOR)
+
     if os.environ.get("BOT_CONSOLE_LOGS", "1") != "0":
         console = logging.StreamHandler()
         console.setLevel(resolved_level)
@@ -300,6 +304,7 @@ def setup_logging(level: str | int | None = None) -> logging.Logger:
     error_logger.setLevel(logging.WARNING)
     error_logger.propagate = False
     error_logger.addHandler(error_handler)
+    error_logger.addHandler(ERROR_BURST_MONITOR)
 
     return app_logger
 

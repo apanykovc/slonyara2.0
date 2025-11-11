@@ -26,6 +26,13 @@ from ..core.constants import (
     CB_MENU,
     CB_MY,
     CB_MY_PAGE,
+    CB_LOGS,
+    CB_LOGS_APP,
+    CB_LOGS_AUDIT,
+    CB_LOGS_CLEAR,
+    CB_LOGS_CLEAR_CONFIRM,
+    CB_LOGS_DOWNLOAD,
+    CB_LOGS_ERROR,
     CB_OFF_DEC,
     CB_OFF_INC,
     CB_OFF_PRESET_10,
@@ -104,6 +111,7 @@ def settings_menu_kb(is_owner: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⏳ Оффсет (мин)", callback_data=CB_SET_OFFSET)],
         [InlineKeyboardButton(text="📋 Чаты", callback_data=CB_CHATS)],
         [InlineKeyboardButton(text="📦 Архив", callback_data=CB_ARCHIVE)],
+        [InlineKeyboardButton(text="📜 Логи", callback_data=CB_LOGS)],
     ]
     if is_owner:
         rows.append([InlineKeyboardButton(text="👥 Админы", callback_data=CB_ADMINS)])
@@ -161,6 +169,28 @@ def chats_menu_kb(known_chats: list | None = None) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="(пусто)", callback_data=CB_CHATS)])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_SETTINGS)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def logs_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📗 App", callback_data=CB_LOGS_APP)],
+            [InlineKeyboardButton(text="🧾 Audit", callback_data=CB_LOGS_AUDIT)],
+            [InlineKeyboardButton(text="❌ Error", callback_data=CB_LOGS_ERROR)],
+            [InlineKeyboardButton(text="📥 Скачать все", callback_data=CB_LOGS_DOWNLOAD)],
+            [InlineKeyboardButton(text="🧹 Очистить", callback_data=CB_LOGS_CLEAR)],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_SETTINGS)],
+        ]
+    )
+
+
+def logs_clear_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Очистить", callback_data=CB_LOGS_CLEAR_CONFIRM)],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data=CB_LOGS)],
+        ]
+    )
 
 
 def job_kb(job_id: str, rrule: str = RR_ONCE) -> InlineKeyboardMarkup:

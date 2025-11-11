@@ -139,6 +139,13 @@ CB_ARCHIVE = "archive"
 CB_ARCHIVE_PAGE = "archive_page"
 CB_ARCHIVE_CLEAR = "archive_clear"
 CB_ARCHIVE_CLEAR_CONFIRM = "archive_clear_yes"
+CB_LOGS = "logs"
+CB_LOGS_APP = "logs_app"
+CB_LOGS_AUDIT = "logs_audit"
+CB_LOGS_ERROR = "logs_error"
+CB_LOGS_DOWNLOAD = "logs_dl"
+CB_LOGS_CLEAR = "logs_clear"
+CB_LOGS_CLEAR_CONFIRM = "logs_clear_yes"
 
 CB_CANCEL = "cancel"  # cancel:<id_задачи>
 CB_SHIFT = "shift"    # shift:<id_задачи>:минуты
@@ -170,3 +177,4 @@ CATCHUP_WINDOW_SECONDS = 5 * 60  # 5 минут
 
 # Пагинация
 PAGE_SIZE = 10
+LOG_PREVIEW_LIMIT = 12

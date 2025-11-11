@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from html import escape
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Sequence
 
 import pytz
 
@@ -14,6 +14,7 @@ from ..core.storage import (
     normalize_offset,
     resolve_tz_for_chat,
 )
+from ..core import logs as log_utils
 
 
 def escape_md(text: str) -> str:
@@ -174,6 +175,24 @@ def render_active_text(
         lines.append("")
         lines.append(escape(empty_message))
     return "\n".join(lines)
+
+
+def render_logs_preview(log_type: str, entries: Sequence[str], limit: int) -> str:
+    labels = {
+        log_utils.LOG_TYPE_APP: "📗 <b>App</b>",
+        log_utils.LOG_TYPE_AUDIT: "🧾 <b>Audit</b>",
+        log_utils.LOG_TYPE_ERROR: "❌ <b>Error</b>",
+    }
+    kind = log_type.lower()
+    title = labels.get(kind, f"📜 <b>{escape(kind.title())}</b>")
+    header = f"{title} — последние {limit} записей"
+    if not entries:
+        body = "<i>Пока записей нет.</i>"
+    else:
+        snippet = "\n".join(escape(line) for line in entries[-limit:])
+        body = f"<pre>{snippet}</pre>"
+    hint = "Откройте другие разделы или скачайте архив, чтобы посмотреть полную историю."
+    return f"{header}\n\n{body}\n\n<small>{escape(hint)}</small>"
 
 
 def render_archive_text(
