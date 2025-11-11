@@ -107,6 +107,7 @@ CB_MENU = "menu"
 CB_SETTINGS = "settings"
 CB_ACTIVE = "active"
 CB_ACTIVE_PAGE = "active_page"   # active_page:<номер>
+CB_ACTIVE_CLEAR = "active_clear"
 CB_MY = "my"
 CB_MY_PAGE = "my_page"
 CB_CREATE = "create"

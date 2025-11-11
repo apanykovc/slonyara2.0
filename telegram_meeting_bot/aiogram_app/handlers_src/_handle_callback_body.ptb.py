@@ -183,10 +183,65 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             )
         return
 
+    if data.startswith(f"{CB_ACTIVE_CLEAR}:"):
+        if not admin:
+            msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
+            auto_delete(msg, context)
+            return
+        parts = data.split(":")
+        if len(parts) < 3:
+            return
+        view = parts[1] if len(parts) > 1 else "all"
+        try:
+            page = max(1, int(parts[2]))
+        except Exception:
+            page = 1
+        if len(parts) == 3:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Да", callback_data=f"{CB_ACTIVE_CLEAR}:{view}:{page}:y")],
+                [InlineKeyboardButton("❌ Нет", callback_data=f"{CB_ACTIVE_PAGE}:{page}")],
+            ])
+            text = "Очистить активные напоминания?\nВы уверены?"
+            await edit_text_safe(q.edit_message_text, text, reply_markup=kb)
+            return
+        records = list(get_jobs_store())
+        removed = 0
+        for rec in records:
+            job_id = rec.get("job_id")
+            if not job_id:
+                continue
+            jobs = context.job_queue.get_jobs_by_name(job_id)
+            for job in jobs:
+                job.schedule_removal()
+            release_signature(rec.get("signature"))
+            archived = archive_job(
+                job_id,
+                rec=rec,
+                reason="bulk_clear",
+                removed_by=_user_payload(user),
+            )
+            if not archived:
+                remove_job_record(job_id)
+            audit_log(
+                "REM_CANCELED",
+                reminder_id=job_id,
+                chat_id=rec.get("target_chat_id"),
+                topic_id=rec.get("topic_id"),
+                user_id=uid,
+                title=rec.get("text"),
+                reason="bulk_clear",
+            )
+            removed += 1
+        note = "🧹 Активные напоминания очищены" if removed else "Активных напоминаний уже нет"
+        msg = await edit_text_safe(q.edit_message_text, note)
+        auto_delete(msg, context)
+        await ensure_panel(update, context)
+        return
+
     if data == CB_HELP:
         text = show_help_text(update)
         try:
-            await edit_text_safe(q.edit_message_text, 
+            await edit_text_safe(q.edit_message_text,
                 text, reply_markup=main_menu_kb(is_admin(user)), parse_mode="Markdown"
             )
         except Exception:
@@ -323,7 +378,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             msg = await reply_text_safe(q.message, "⛔ Нет доступа.")
             auto_delete(msg, context)
             return
-        text = "<b>Очистить архив?</b>\nЭто действие необратимо."
+        text = "❓ <b>Очистить архив?</b>\nВы уверены? Это действие необратимо."
         try:
             await edit_text_safe(
                 q.edit_message_text,
@@ -465,9 +520,12 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         if len(parts) == 2:
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Да", callback_data=f"{CB_CANCEL}:{job_id}:y")],
-                [InlineKeyboardButton("↩️ Назад", callback_data=f"{CB_ACTIONS}:{job_id}")],
+                [InlineKeyboardButton("❌ Нет", callback_data=f"{CB_ACTIONS}:{job_id}")],
             ])
-            await edit_text_safe(q.edit_message_text, "Отменить напоминание?", reply_markup=kb)
+            text = "Отменить напоминание?\nВы уверены?"
+            if rec and rec.get("text"):
+                text = f"{text}\n\n{rec.get('text')}"
+            await edit_text_safe(q.edit_message_text, text, reply_markup=kb)
             return
         jobs = context.job_queue.get_jobs_by_name(job_id)
         if jobs:

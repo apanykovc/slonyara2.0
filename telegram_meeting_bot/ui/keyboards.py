@@ -7,6 +7,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardBu
 from ..core.constants import (
     CB_ACTIONS,
     CB_ACTIVE,
+    CB_ACTIVE_CLEAR,
     CB_ACTIVE_PAGE,
     CB_ADMIN_ADD,
     CB_ADMIN_DEL,
@@ -233,12 +234,7 @@ def log_file_view_kb(log_type: str) -> InlineKeyboardMarkup:
 
 
 def logs_clear_confirm_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Очистить", callback_data=CB_LOGS_CLEAR_CONFIRM)],
-            [InlineKeyboardButton(text="⬅️ Отмена", callback_data=CB_LOGS)],
-        ]
-    )
+    return confirm_kb(CB_LOGS_CLEAR_CONFIRM, CB_LOGS)
 
 
 def job_kb(job_id: str, rrule: str = RR_ONCE) -> InlineKeyboardMarkup:
@@ -313,6 +309,13 @@ def active_kb(
         rows.append(nav)
     else:
         rows.append([InlineKeyboardButton(text="⟲ Обновить", callback_data=f"{page_prefix}:{page}")])
+    if is_admin and view == "all" and chunk:
+        rows.append([
+            InlineKeyboardButton(
+                text="🧹 Очистить все",
+                callback_data=f"{CB_ACTIVE_CLEAR}:{view}:{page}",
+            )
+        ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -340,12 +343,27 @@ def archive_kb(
 
 
 def archive_clear_confirm_kb() -> InlineKeyboardMarkup:
+    return confirm_kb(CB_ARCHIVE_CLEAR_CONFIRM, CB_ARCHIVE)
+
+
+def confirm_kb(yes_data: str, no_data: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Да, очистить", callback_data=CB_ARCHIVE_CLEAR_CONFIRM)],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=CB_ARCHIVE)],
+            [InlineKeyboardButton(text="✅ Да", callback_data=yes_data)],
+            [InlineKeyboardButton(text="❌ Нет", callback_data=no_data)],
         ]
     )
+
+
+def active_clear_confirm_kb(
+    page: int,
+    *,
+    view: str = "all",
+    page_prefix: str = CB_ACTIVE_PAGE,
+) -> InlineKeyboardMarkup:
+    yes_data = f"{CB_ACTIVE_CLEAR}:{view}:{page}:y"
+    no_data = f"{page_prefix}:{page}"
+    return confirm_kb(yes_data, no_data)
 
 
 def actions_kb(
