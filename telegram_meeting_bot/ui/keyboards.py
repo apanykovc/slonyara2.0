@@ -276,9 +276,10 @@ def actions_kb(
     *,
     return_to: str | None = None,
 ) -> InlineKeyboardMarkup:
+    suffix = f":{return_to}" if return_to else ""
     rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(text="📤 Отправить сейчас", callback_data=f"{CB_SENDNOW}:{job_id}")],
-        [InlineKeyboardButton(text="❌ Отменить", callback_data=f"{CB_CANCEL}:{job_id}")],
+        [InlineKeyboardButton(text="📤 Отправить сейчас", callback_data=f"{CB_SENDNOW}:{job_id}{suffix}")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data=f"{CB_CANCEL}:{job_id}{suffix}")],
     ]
     if is_admin:
         rows.append(
@@ -287,7 +288,6 @@ def actions_kb(
                 InlineKeyboardButton(text="➕ +10", callback_data=f"{CB_SHIFT}:{job_id}:10"),
             ]
         )
-    suffix = f":{return_to}" if return_to else ""
     rows.append(
         [InlineKeyboardButton(text="↩️ Назад", callback_data=f"{CB_ACTIONS}:{job_id}:close{suffix}")]
     )
