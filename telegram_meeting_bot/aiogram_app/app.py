@@ -22,6 +22,7 @@ from aiogram.types import (
     BotCommand,
     CallbackQuery,
     ChatMemberUpdated,
+    FSInputFile,
     InlineKeyboardMarkup,
     Message,
     User,
@@ -30,7 +31,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from tzlocal import get_localzone_name
 
-from telegram_meeting_bot.core import constants, storage
+from telegram_meeting_bot.core import constants, logs as log_utils, storage
 from telegram_meeting_bot.core.audit import audit_log
 from telegram_meeting_bot.core.logging_setup import setup_logging
 from telegram_meeting_bot.core.parsing import parse_meeting_message
@@ -802,6 +803,44 @@ async def _show_chats(message: Message) -> None:
         await _answer_safe(message, text, reply_markup=kb)
 
 
+async def _show_logs_menu(message: Message, notice: str | None = None) -> None:
+    text = "📜 Логи"
+    if notice:
+        text = f"{text}\n\n<i>{escape(notice)}</i>"
+    kb = ui_kb.logs_menu_kb()
+    try:
+        await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def _show_log_preview(message: Message, log_type: str) -> None:
+    limit = getattr(constants, "LOG_PREVIEW_LIMIT", 12)
+    entries = await asyncio.to_thread(log_utils.get_recent_entries, log_type, limit=limit)
+    text = ui_txt.render_logs_preview(log_type, entries, limit)
+    kb = ui_kb.logs_menu_kb()
+    try:
+        await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def _send_logs_archive(message: Message) -> None:
+    path = await asyncio.to_thread(log_utils.build_logs_archive)
+    try:
+        file = FSInputFile(path, filename=path.name)
+        await _telegram_call(
+            lambda: message.answer_document(
+                document=file,
+                caption="📥 Архив логов",
+            ),
+            description="send logs archive",
+        )
+    finally:
+        with suppress(Exception):
+            path.unlink(missing_ok=True)
+
+
 async def _show_admins(message: Message) -> None:
     admins = constants.ADMIN_USERNAMES
     text = ui_txt.render_admins_text(admins)
@@ -810,6 +849,55 @@ async def _show_admins(message: Message) -> None:
         await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
     except TelegramBadRequest:
         await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+
+
+def _install_error_burst_notifier(bot: Bot) -> None:
+    loop = asyncio.get_running_loop()
+
+    def _callback(record: logging.LogRecord, count: int) -> None:
+        payload = dict(getattr(record, "json_payload", {}) or {})
+        where = payload.get("where") or record.name
+        message = payload.get("message") or record.getMessage()
+        error_type = payload.get("type") or getattr(record, "error_type", "ERROR")
+        snapshot = {
+            "where": where,
+            "message": message,
+            "type": error_type,
+            "count": count,
+        }
+
+        def _schedule() -> None:
+            asyncio.create_task(_notify_error_burst(bot, snapshot))
+
+        try:
+            loop.call_soon_threadsafe(_schedule)
+        except RuntimeError:
+            logger.exception("Failed to schedule error burst notification")
+
+    log_utils.set_error_burst_callback(_callback)
+
+
+async def _notify_error_burst(bot: Bot, snapshot: dict[str, Any]) -> None:
+    if not constants.ADMIN_IDS:
+        return
+    count = snapshot.get("count", 0)
+    where = snapshot.get("where", "reminder.error")
+    message = snapshot.get("message", "")
+    error_type = snapshot.get("type", "ERROR")
+    text = (
+        "⚠️ <b>Внимание: серия ошибок</b>\n"
+        f"За последние минуты зафиксировано <b>{int(count)}</b> ошибок."
+        f"\nТип: <code>{escape(str(error_type))}</code>"
+        f"\nИсточник: <code>{escape(str(where))}</code>"
+    )
+    if message:
+        text += f"\nСообщение: <code>{escape(str(message))}</code>"
+    text += "\n\nПроверьте error-логи."  # noqa: W503
+    for admin_id in constants.ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML)
+        except Exception:
+            logger.debug("Failed to notify admin %s about error burst", admin_id, exc_info=True)
 
 
 async def _show_archive(
@@ -1256,6 +1344,67 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         await _callback_answer_safe(query)
         return
 
+    if data == constants.CB_LOGS:
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может управлять логами.")
+            await _callback_answer_safe(query)
+            return
+        await _show_logs_menu(message)
+        await _callback_answer_safe(query)
+        return
+
+    if data in {
+        constants.CB_LOGS_APP,
+        constants.CB_LOGS_AUDIT,
+        constants.CB_LOGS_ERROR,
+    }:
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может управлять логами.")
+            await _callback_answer_safe(query)
+            return
+        log_type = {
+            constants.CB_LOGS_APP: log_utils.LOG_TYPE_APP,
+            constants.CB_LOGS_AUDIT: log_utils.LOG_TYPE_AUDIT,
+            constants.CB_LOGS_ERROR: log_utils.LOG_TYPE_ERROR,
+        }[data]
+        await _show_log_preview(message, log_type)
+        await _callback_answer_safe(query)
+        return
+
+    if data == constants.CB_LOGS_DOWNLOAD:
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может управлять логами.")
+            await _callback_answer_safe(query)
+            return
+        await _send_logs_archive(message)
+        await _callback_answer_safe(query, "Архив отправлен")
+        return
+
+    if data == constants.CB_LOGS_CLEAR:
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может управлять логами.")
+            await _callback_answer_safe(query)
+            return
+        text = "<b>Очистить журналы?</b>\nТекущие файлы будут обнулены, архивы удалены."
+        kb = ui_kb.logs_clear_confirm_kb()
+        try:
+            await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except TelegramBadRequest:
+            await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await _callback_answer_safe(query)
+        return
+
+    if data == constants.CB_LOGS_CLEAR_CONFIRM:
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может управлять логами.")
+            await _callback_answer_safe(query)
+            return
+        affected = await asyncio.to_thread(log_utils.clear_all_logs)
+        note = "Логи очищены." if affected else "Логи уже пусты."
+        await _show_logs_menu(message, notice=note)
+        await _callback_answer_safe(query, "Очищено")
+        return
+
     if data == constants.CB_CREATE:
         await state.update_data({STATE_FORCE_PICK: True})
         await _show_create_hint(message, user)
@@ -1647,6 +1796,7 @@ async def on_shutdown() -> None:
     if scheduler.running:
         scheduler.shutdown(wait=False)
     logger.info("Shutdown complete")
+    log_utils.set_error_burst_callback(None)
 
 
 async def main() -> None:
@@ -1655,6 +1805,7 @@ async def main() -> None:
     if not token:
         raise SystemExit("Token not configured")
     bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+    _install_error_burst_notifier(bot)
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.middleware(ErrorsMiddleware())
     dp.callback_query.middleware(ErrorsMiddleware())
