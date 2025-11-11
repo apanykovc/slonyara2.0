@@ -856,12 +856,38 @@ def _remove_job(
     record: Optional[Dict[str, Any]] = None,
     removed_by: Optional[Dict[str, Any]] = None,
 ) -> None:
+    removed = False
     if archive_reason:
-        storage.archive_job(job_id, rec=record, reason=archive_reason, removed_by=removed_by)
-    else:
+        removed = storage.archive_job(
+            job_id,
+            rec=record,
+            reason=archive_reason,
+            removed_by=removed_by,
+        )
+    if not removed:
         storage.remove_job_record(job_id)
     with suppress(Exception):
         scheduler.remove_job(job_id)
+
+
+def _parse_job_callback(data: str, prefix: str) -> tuple[Optional[str], tuple[str, ...]]:
+    if not data.startswith(f"{prefix}:"):
+        return None, ()
+    parts = data.split(":")
+    if len(parts) < 2:
+        return None, ()
+    job_id = parts[1]
+    extras = tuple(parts[2:]) if len(parts) > 2 else ()
+    return job_id or None, extras
+
+
+def _resolve_view_hint(extras: tuple[str, ...]) -> Optional[str]:
+    for extra in extras:
+        if not extra or extra == "y":
+            continue
+        if extra in {"my", "all"}:
+            return extra
+    return None
 
 
 async def _open_actions(
@@ -1512,13 +1538,24 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             return
 
     if data.startswith(f"{constants.CB_SENDNOW}:"):
-        job_id = data.split(":", 1)[1]
+        job_id, extras = _parse_job_callback(data, constants.CB_SENDNOW)
+        if not job_id:
+            await _callback_answer_safe(query, "Некорректные данные", show_alert=True)
+            return
         await send_reminder_job(job_id=job_id)
+        view_hint = _resolve_view_hint(extras)
+        if view_hint == "my":
+            await _show_active(message, user, page=1, mine=True)
+        elif view_hint == "all":
+            await _show_active(message, user, page=1)
         await _callback_answer_safe(query, "Отправлено")
         return
 
     if data.startswith(f"{constants.CB_CANCEL}:"):
-        job_id = data.split(":", 1)[1]
+        job_id, extras = _parse_job_callback(data, constants.CB_CANCEL)
+        if not job_id:
+            await _callback_answer_safe(query, "Некорректные данные", show_alert=True)
+            return
         job = _get_job(job_id)
         if job:
             _remove_job(
@@ -1539,7 +1576,11 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
                 title=job.get("text"),
                 reason="manual",
             )
-        await _show_active(message, user, page=1)
+        view_hint = _resolve_view_hint(extras)
+        if view_hint == "my":
+            await _show_active(message, user, page=1, mine=True)
+        else:
+            await _show_active(message, user, page=1)
         await _callback_answer_safe(query, "Удалено")
         return
 
