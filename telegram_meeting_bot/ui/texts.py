@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
+import re
 from html import escape
 from typing import Any, Dict, Iterable, Sequence
 
@@ -15,6 +17,66 @@ from ..core.storage import (
     resolve_tz_for_chat,
 )
 from ..core import logs as log_utils
+
+
+MOSCOW_TZ = pytz.timezone("Europe/Moscow")
+APP_LOG_RE = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?P<rest>.*)$")
+APP_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _parse_utc_naive(timestamp: str) -> datetime | None:
+    try:
+        dt = datetime.strptime(timestamp, APP_TS_FORMAT)
+    except ValueError:
+        return None
+    return pytz.utc.localize(dt)
+
+
+def _parse_iso_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    ts = value
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = pytz.utc.localize(dt)
+    return dt.astimezone(pytz.utc)
+
+
+def _format_app_log(line: str) -> str:
+    match = APP_LOG_RE.match(line)
+    if not match:
+        return line
+    dt = _parse_utc_naive(match.group("ts"))
+    if dt is None:
+        return line
+    dt_local = dt.astimezone(MOSCOW_TZ)
+    return f"{dt_local.strftime(APP_TS_FORMAT)} MSK{match.group('rest')}"
+
+
+def _format_json_log(line: str) -> str:
+    try:
+        payload = json.loads(line)
+    except (TypeError, ValueError):
+        return line
+    ts = payload.get("ts") or payload.get("timestamp")
+    dt = _parse_iso_timestamp(ts)
+    if dt is not None:
+        payload["ts_msk"] = dt.astimezone(MOSCOW_TZ).strftime(APP_TS_FORMAT)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _format_log_line(log_type: str, line: str) -> str:
+    key = log_type.lower()
+    if key == log_utils.LOG_TYPE_APP:
+        return _format_app_log(line)
+    if key in {log_utils.LOG_TYPE_AUDIT, log_utils.LOG_TYPE_ERROR}:
+        return _format_json_log(line)
+    return line
 
 
 def escape_md(text: str) -> str:
@@ -183,16 +245,26 @@ def render_logs_preview(log_type: str, entries: Sequence[str], limit: int) -> st
         log_utils.LOG_TYPE_AUDIT: "🧾 <b>Audit</b>",
         log_utils.LOG_TYPE_ERROR: "❌ <b>Error</b>",
     }
+    descriptions = {
+        log_utils.LOG_TYPE_APP: "Рабочие события бота и планировщика.",
+        log_utils.LOG_TYPE_AUDIT: "История действий пользователей и изменений напоминаний.",
+        log_utils.LOG_TYPE_ERROR: "Ошибки, предупреждения и служебные исключения.",
+    }
     kind = log_type.lower()
     title = labels.get(kind, f"📜 <b>{escape(kind.title())}</b>")
-    header = f"{title} — последние {limit} записей"
+    header_lines = [f"{title} — последние {limit} записей"]
+    description = descriptions.get(kind)
+    if description:
+        header_lines.append(f"<i>{escape(description)}</i>")
+    header = "\n".join(header_lines)
     if not entries:
         body = "<i>Пока записей нет.</i>"
     else:
-        snippet = "\n".join(escape(line) for line in entries[-limit:])
+        formatted = [_format_log_line(kind, line) for line in entries[-limit:]]
+        snippet = "\n".join(escape(line) for line in formatted)
         body = f"<pre>{snippet}</pre>"
     hint = "Откройте другие разделы или скачайте архив, чтобы посмотреть полную историю."
-    return f"{header}\n\n{body}\n\n<small>{escape(hint)}</small>"
+    return f"{header}\n\n{body}\n\n<i>{escape(hint)}</i>"
 
 
 def render_archive_text(
