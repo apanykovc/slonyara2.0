@@ -814,11 +814,26 @@ async def _show_logs_menu(message: Message, notice: str | None = None) -> None:
         await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
-async def _show_log_preview(message: Message, log_type: str) -> None:
-    limit = getattr(constants, "LOG_PREVIEW_LIMIT", 12)
-    entries = await asyncio.to_thread(log_utils.get_recent_entries, log_type, limit=limit)
-    text = ui_txt.render_logs_preview(log_type, entries, limit)
-    kb = ui_kb.logs_menu_kb()
+async def _show_log_files(message: Message, log_type: str) -> None:
+    files = await asyncio.to_thread(log_utils.list_log_files, log_type)
+    text = ui_txt.render_log_file_list(log_type, files)
+    kb = ui_kb.log_files_kb(log_type, files)
+    try:
+        await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+async def _show_log_file(message: Message, log_type: str, file_name: str) -> None:
+    try:
+        info = await asyncio.to_thread(log_utils.get_log_file_info, log_type, file_name)
+    except FileNotFoundError:
+        await _answer_safe(message, "⚠️ Файл недоступен или был удалён.")
+        await _show_log_files(message, log_type)
+        return
+    view = await asyncio.to_thread(log_utils.read_log_entries, log_type, info.path)
+    text = ui_txt.render_log_file(log_type, info, view)
+    kb = ui_kb.log_file_view_kb(log_type)
     try:
         await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
     except TelegramBadRequest:
@@ -1367,7 +1382,31 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             constants.CB_LOGS_AUDIT: log_utils.LOG_TYPE_AUDIT,
             constants.CB_LOGS_ERROR: log_utils.LOG_TYPE_ERROR,
         }[data]
-        await _show_log_preview(message, log_type)
+        await _show_log_files(message, log_type)
+        await _callback_answer_safe(query)
+        return
+
+    if data.startswith(f"{constants.CB_LOGS_FILE}:"):
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может управлять логами.")
+            await _callback_answer_safe(query)
+            return
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await _callback_answer_safe(query)
+            return
+        _, kind_raw, file_name = parts
+        kind = kind_raw.lower()
+        if kind not in {
+            log_utils.LOG_TYPE_APP,
+            log_utils.LOG_TYPE_AUDIT,
+            log_utils.LOG_TYPE_ERROR,
+        }:
+            await _answer_safe(message, "⚠️ Неизвестный тип журнала.")
+            await _show_logs_menu(message)
+            await _callback_answer_safe(query)
+            return
+        await _show_log_file(message, kind, file_name)
         await _callback_answer_safe(query)
         return
 
