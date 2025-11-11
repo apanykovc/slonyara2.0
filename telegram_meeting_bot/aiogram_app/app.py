@@ -1424,7 +1424,10 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             await _answer_safe(message, "⛔ Только администратор может управлять логами.")
             await _callback_answer_safe(query)
             return
-        text = "<b>Очистить журналы?</b>\nТекущие файлы будут обнулены, архивы удалены."
+        text = (
+            "❓ <b>Очистить журналы?</b>\n"
+            "Вы уверены? Текущие файлы будут обнулены, архивы удалены."
+        )
         kb = ui_kb.logs_clear_confirm_kb()
         try:
             await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -1473,6 +1476,65 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
         await _show_active(message, user, page=page)
         await _ensure_reply_menu(message, state)
         await _callback_answer_safe(query)
+        return
+
+    if data.startswith(f"{constants.CB_ACTIVE_CLEAR}:"):
+        if not _is_admin(user):
+            await _answer_safe(message, "⛔ Только администратор может менять настройки.")
+            await _callback_answer_safe(query)
+            return
+        parts = data.split(":")
+        if len(parts) < 3:
+            await _callback_answer_safe(query, "Некорректные данные", show_alert=True)
+            return
+        view = parts[1] or "all"
+        try:
+            page = int(parts[2])
+        except ValueError:
+            page = 1
+        if len(parts) == 3:
+            page_prefix = constants.CB_MY_PAGE if view == "my" else constants.CB_ACTIVE_PAGE
+            kb = ui_kb.active_clear_confirm_kb(page, view=view, page_prefix=page_prefix)
+            text = (
+                "❓ <b>Очистить активные напоминания?</b>\n"
+                "Вы уверены? Все текущие задачи будут перенесены в архив."
+            )
+            try:
+                await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            except TelegramBadRequest:
+                await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            await _callback_answer_safe(query)
+            return
+
+        jobs = storage.get_jobs_store()
+        removed_by = _serialize_user(user)
+        removed = 0
+        for rec in jobs:
+            job_id = rec.get("job_id")
+            if not job_id:
+                continue
+            _remove_job(
+                job_id,
+                archive_reason="bulk_clear",
+                record=rec,
+                removed_by=removed_by,
+            )
+            audit_log(
+                "REM_CANCELED",
+                reminder_id=job_id,
+                chat_id=rec.get("target_chat_id"),
+                topic_id=rec.get("topic_id"),
+                user_id=getattr(user, "id", None),
+                title=rec.get("text"),
+                reason="bulk_clear",
+            )
+            removed += 1
+        if view == "my":
+            await _show_active(message, user, page=1, mine=True)
+        else:
+            await _show_active(message, user, page=1)
+        await _ensure_reply_menu(message, state)
+        await _callback_answer_safe(query, "Очищено")
         return
 
     if data == constants.CB_SET_TZ:
@@ -1599,7 +1661,10 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             await _answer_safe(message, "⛔ Только администратор может менять настройки.")
             await _callback_answer_safe(query)
             return
-        text = "<b>Очистить архив?</b>\nЭто действие необратимо."
+        text = (
+            "❓ <b>Очистить архив?</b>\n"
+            "Вы уверены? Это действие необратимо."
+        )
         kb = ui_kb.archive_clear_confirm_kb()
         try:
             await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -1745,6 +1810,30 @@ async def on_callback(query: CallbackQuery, state: FSMContext) -> None:
             await _callback_answer_safe(query, "Некорректные данные", show_alert=True)
             return
         job = _get_job(job_id)
+        if not extras or extras[-1] != "y":
+            if not job:
+                await _callback_answer_safe(query, "Не найдено", show_alert=True)
+                return
+            view_hint = _resolve_view_hint(extras)
+            yes_parts = [constants.CB_CANCEL, job_id]
+            if view_hint:
+                yes_parts.append(view_hint)
+            yes_parts.append("y")
+            yes_data = ":".join(yes_parts)
+            no_data = f"{constants.CB_ACTIONS}:{job_id}"
+            if view_hint:
+                no_data = f"{no_data}:{view_hint}"
+            kb = ui_kb.confirm_kb(yes_data, no_data)
+            preview = escape(job.get("text", "") or "")
+            text = "❓ <b>Отменить напоминание?</b>\nВы уверены?"
+            if preview:
+                text = f"{text}\n\n<code>{preview}</code>"
+            try:
+                await _edit_text_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            except TelegramBadRequest:
+                await _answer_safe(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            await _callback_answer_safe(query)
+            return
         if job:
             _remove_job(
                 job_id,
