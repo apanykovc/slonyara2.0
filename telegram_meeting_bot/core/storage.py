@@ -148,6 +148,16 @@ def _connect() -> sqlite3.Connection:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS reminders (job_id TEXT PRIMARY KEY, data TEXT NOT NULL)"
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS archived_reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT,
+            archived_at TEXT NOT NULL,
+            data TEXT NOT NULL
+        )
+        """
+    )
     # миграция со старого JSON, если таблица пустая
     try:
         cur = conn.execute("SELECT COUNT(*) AS c FROM reminders")
