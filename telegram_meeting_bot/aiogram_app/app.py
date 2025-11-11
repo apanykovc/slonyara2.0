@@ -646,16 +646,46 @@ async def schedule_reminder(
     }
 
     if reminder_utc <= now_utc:
-        audit_log(
-            "REM_SEND_NOW",
-            chat_id=target_chat_id,
-            topic_id=topic_id,
-            title=parsed["reminder_text"],
-            user_id=getattr(user, "id", None),
+        target_chat_norm = _extract_chat_id(target_chat_id)
+        source_chat_norm = _extract_chat_id(source_chat_id)
+        same_topic = int(topic_id or 0) == int(getattr(message, "message_thread_id", 0) or 0)
+        suppress_immediate = (
+            not notify
+            and target_chat_norm is not None
+            and source_chat_norm is not None
+            and target_chat_norm == source_chat_norm
+            and same_topic
         )
-        await _send_safe(message.bot, target_chat_id, job_data["text"], message_thread_id=topic_id)
+
+        if suppress_immediate:
+            audit_log(
+                "REM_SEND_NOW_SUPPRESSED",
+                chat_id=target_chat_id,
+                topic_id=topic_id,
+                title=parsed["reminder_text"],
+                user_id=getattr(user, "id", None),
+                reason="notify_disabled_same_chat",
+            )
+        else:
+            audit_log(
+                "REM_SEND_NOW",
+                chat_id=target_chat_id,
+                topic_id=topic_id,
+                title=parsed["reminder_text"],
+                user_id=getattr(user, "id", None),
+            )
+            await _send_safe(
+                message.bot,
+                target_chat_id,
+                job_data["text"],
+                message_thread_id=topic_id,
+            )
+
         if notify:
-            await _answer_safe(message, "✅ Напоминание уже должно было прийти — отправил сразу.")
+            await _answer_safe(
+                message,
+                "✅ Напоминание уже должно было прийти — отправил сразу.",
+            )
         return
 
     _schedule_job(job_id, reminder_utc)
