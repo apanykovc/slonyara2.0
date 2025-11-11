@@ -3,6 +3,7 @@ import re
 import json
 from collections import deque
 from pathlib import Path
+from typing import Iterable
 
 
 def _int_from_env(name: str, default: int) -> int:
@@ -13,6 +14,22 @@ def _int_from_env(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _load_username_set(path: Path, *, fallback: Iterable[str]) -> set[str]:
+    """Return usernames stored in ``path`` merged with the fallback values."""
+
+    base = {u.lstrip("@").lower() for u in fallback if u}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return set(base)
+    except (json.JSONDecodeError, OSError):
+        return set(base)
+
+    stored = {u.lstrip("@").lower() for u in raw if isinstance(u, str) and u.strip()}
+    return set(base).union(stored)
 
 VERSION = "2.5.0"
 
@@ -46,35 +63,11 @@ ADMIN_IDS = {
 
 # Логины админов (без @) из файла data/admins.json
 ADMINS_PATH = DATA_DIR / "admins.json"
-try:
-    with ADMINS_PATH.open("r", encoding="utf-8") as f:
-        ADMIN_USERNAMES = {u.lstrip("@").lower() for u in json.load(f) if isinstance(u, str)}
-except FileNotFoundError:
-    ADMIN_USERNAMES = {"slonyara"}
-    try:
-        ADMINS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with ADMINS_PATH.open("w", encoding="utf-8") as f:
-            json.dump(sorted(ADMIN_USERNAMES), f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-else:
-    ADMIN_USERNAMES.add("slonyara")
+ADMIN_USERNAMES = _load_username_set(ADMINS_PATH, fallback={"slonyara"})
 
 # Логины владельцев (без @) из файла data/owners.json
 OWNERS_PATH = DATA_DIR / "owners.json"
-try:
-    with OWNERS_PATH.open("r", encoding="utf-8") as f:
-        OWNER_USERNAMES = {u.lstrip("@").lower() for u in json.load(f) if isinstance(u, str)}
-except FileNotFoundError:
-    OWNER_USERNAMES = {"panykovc", "slonyara"}
-    try:
-        OWNERS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with OWNERS_PATH.open("w", encoding="utf-8") as f:
-            json.dump(sorted(OWNER_USERNAMES), f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-else:
-    OWNER_USERNAMES.add("slonyara")
+OWNER_USERNAMES = _load_username_set(OWNERS_PATH, fallback={"panykovc", "slonyara"})
 
 # Настройки для каждого чата
 CFG_PATH = DATA_DIR / "config.json"
