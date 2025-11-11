@@ -1314,15 +1314,8 @@ async def handle_group_text(message: Message) -> None:
     if not message.text or message.text.startswith("/"):
         return
     await _ensure_known_chat(message)
-    await schedule_reminder(
-        message=message,
-        source_chat_id=message.chat.id,
-        target_chat_id=message.chat.id,
-        user=message.from_user,
-        text=message.text.strip(),
-        topic_id=message.message_thread_id,
-        notify=False,
-    )
+    # Напоминания должны создаваться только через личный диалог с ботом,
+    # поэтому в группах просто регистрируем чат и игнорируем текст.
 
 # === Callback handling ===
 
